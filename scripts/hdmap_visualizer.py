@@ -5,6 +5,7 @@ import os
 import sys
 import rclpy
 from rclpy.node import Node
+from rclpy.executors import ExternalShutdownException
 from rclpy.qos import QoSProfile, DurabilityPolicy
 from geometry_msgs.msg import Point
 from visualization_msgs.msg import Marker, MarkerArray
@@ -131,16 +132,18 @@ class HDMapVisualizer(Node):
 
 
 def main(args=None):
-    rclpy.init(args=args)
-    node = HDMapVisualizer()
-
+    node = None
     try:
+        rclpy.init(args=args)
+        node = HDMapVisualizer()
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
-        node.destroy_node()
-        rclpy.shutdown()
+        if node is not None:
+            node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":

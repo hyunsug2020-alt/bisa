@@ -62,6 +62,7 @@ add_library(ltv_mpc_core SHARED
   src/ltv_mpc/ltv_cost.cpp
   src/ltv_mpc/ltv_solver.cpp
   src/ltv_mpc/ltv_mpc.cpp
+  src/ltv_mpc/ltv_obstacle.cpp
 )
 ament_target_dependencies(ltv_mpc_core
   rclcpp geometry_msgs nav_msgs
@@ -92,6 +93,25 @@ target_link_libraries(mpc_path_tracker_cpp
   mpc_controller_cpp
 )
 target_include_directories(mpc_path_tracker_cpp PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
+  $<INSTALL_INTERFACE:include>
+  /usr/include/eigen3
+)
+
+# ================================================================
+# ltv_obstacle_avoidance_node (실행 파일)
+# ================================================================
+add_executable(ltv_obstacle_avoidance_node
+  src/ltv_obstacle_avoidance_node.cpp
+)
+ament_target_dependencies(ltv_obstacle_avoidance_node
+  rclcpp std_msgs geometry_msgs nav_msgs
+)
+target_link_libraries(ltv_obstacle_avoidance_node
+  ltv_mpc_core
+)
+target_include_directories(ltv_obstacle_avoidance_node PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
   $<INSTALL_INTERFACE:include>
@@ -165,6 +185,7 @@ install(PROGRAMS
   scripts/analyze_mpc_performance.py
   scripts/cav_path_error_gui.py
   scripts/cav_runtime_log_gui.py
+  scripts/zero_accel_pub.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
@@ -172,6 +193,7 @@ install(PROGRAMS
 install(TARGETS
   local_path_pub_cpp
   mpc_path_tracker_cpp
+  ltv_obstacle_avoidance_node
   priority_collision_gate
   offline_speed_scheduler
   DESTINATION lib/${PROJECT_NAME}

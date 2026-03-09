@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 
 import math
+import signal
 import threading
 import time
 from collections import deque
@@ -11,7 +12,8 @@ import rclpy
 from geometry_msgs.msg import Accel
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
-from std_msgs.msg import Float64, String
+from rclpy.executors import ExternalShutdownException
+from std_msgs.msg import Bool, Float64, String
 from tkinter import Tk, StringVar
 from tkinter import scrolledtext, ttk
 
@@ -58,6 +60,7 @@ class RuntimeLogMonitor(Node):
                 "cap": float("nan"),
                 "flags": "",
                 "solver": "N/A",
+                "avoid_active": False,
                 "updated": 0.0,
                 "raw_zero_pass_latched": False,
                 "sim_zero_pass_latched": False,
@@ -79,6 +82,7 @@ class RuntimeLogMonitor(Node):
             out_topic = f"/sim/cav{id_str}/accel"
             cap_topic = f"/cav{id_str}/offline_speed_cap"
             perf_topic = f"/cav{id_str}/mpc_performance"
+            avoid_topic = f"/cav{id_str}/obstacle_avoidance_active"
 
             self._subs.append(
                 self.create_subscription(
@@ -105,10 +109,15 @@ class RuntimeLogMonitor(Node):
                     MPCPerformance, perf_topic, lambda msg, cid=cav_id: self._perf_cb(cid, msg), qos_status
                 )
             )
+            self._subs.append(
+                self.create_subscription(
+                    Bool, avoid_topic, lambda msg, cid=cav_id: self._avoid_cb(cid, msg), qos_status
+                )
+            )
 
             self.get_logger().info(
                 f"CAV{cav_id:02d} topics: gate={gate_topic}, raw={raw_topic}, sim={out_topic}, "
-                f"cap={cap_topic}, perf={perf_topic}"
+                f"cap={cap_topic}, perf={perf_topic}, avoid={avoid_topic}"
             )
 
     def _push_event(self, text: str) -> None:
@@ -209,6 +218,19 @@ class RuntimeLogMonitor(Node):
             if solver != prev_solver:
                 self._push_event(f"CAV{cav_id:02d} solver: {prev_solver} -> {solver}")
 
+    def _avoid_cb(self, cav_id: int, msg: Bool) -> None:
+        now = time.monotonic()
+        avoid_active = bool(msg.data)
+        with self._lock:
+            s = self.state[cav_id]
+            prev_avoid = bool(s["avoid_active"])
+            s["avoid_active"] = avoid_active
+            s["updated"] = now
+            if avoid_active != prev_avoid:
+                prev_text = "ON" if prev_avoid else "OFF"
+                next_text = "ON" if avoid_active else "OFF"
+                self._push_event(f"CAV{cav_id:02d} avoidance: {prev_text} -> {next_text}")
+
     def _check_pass_zero_locked(self, cav_id: int, s: Dict[str, object]) -> None:
         mode = str(s["mode"])
         raw_v = float(s["raw_v"]) if isinstance(s["raw_v"], float) else float("nan")
@@ -235,20 +257,24 @@ class RuntimeLogMonitor(Node):
         elif sim_resume:
             s["sim_zero_pass_latched"] = False
 
-    def snapshot(self) -> Tuple[str, List[Tuple[int, str, int, float, float, float, str, str, float]], List[str]]:
+    def snapshot(
+        self,
+    ) -> Tuple[str, List[Tuple[int, str, str, int, float, float, float, str, str, float]], List[str]]:
         with self._lock:
             now = time.monotonic()
             offline_age = (now - self.offline_status_time) if self.offline_status_time > 0.0 else float("nan")
             offline_line = f"offline_status: {self.offline_status} (age={_fmt_float(offline_age, 1)}s)"
 
-            rows: List[Tuple[int, str, int, float, float, float, str, str, float]] = []
+            rows: List[Tuple[int, str, str, int, float, float, float, str, str, float]] = []
             for cav_id in self.cav_ids:
                 s = self.state[cav_id]
                 updated = float(s["updated"]) if isinstance(s["updated"], float) else 0.0
                 age = (now - updated) if updated > 0.0 else float("nan")
+                avoid_text = "ON" if bool(s["avoid_active"]) else "OFF"
                 rows.append(
                     (
                         cav_id,
+                        avoid_text,
                         str(s["mode"]),
                         int(s["block"]),
                         float(s["raw_v"]),
@@ -277,11 +303,12 @@ class RuntimeLogWindow:
         status_label = ttk.Label(self.root, textvariable=self.status_var, font=("TkDefaultFont", 11))
         status_label.pack(fill="x", padx=8, pady=(8, 4))
 
-        columns = ("cav", "mode", "block", "raw_v", "sim_v", "cap", "flags", "solver", "age_s")
+        columns = ("cav", "avoid", "mode", "block", "raw_v", "sim_v", "cap", "flags", "solver", "age_s")
         self.table = ttk.Treeview(self.root, columns=columns, show="headings", height=8)
         for col in columns:
             self.table.heading(col, text=col)
         self.table.column("cav", width=70, anchor="center")
+        self.table.column("avoid", width=90, anchor="center")
         self.table.column("mode", width=90, anchor="center")
         self.table.column("block", width=90, anchor="center")
         self.table.column("raw_v", width=120, anchor="center")
@@ -297,7 +324,7 @@ class RuntimeLogWindow:
                 "",
                 "end",
                 iid=f"cav{cav_id:02d}",
-                values=(cav_id, "-", -1, "-", "-", "-", "-", "-", "-"),
+                values=(cav_id, "OFF", "-", -1, "-", "-", "-", "-", "-", "-"),
             )
 
         self.log = scrolledtext.ScrolledText(self.root, wrap="word", height=24, font=("TkFixedFont", 10))
@@ -319,11 +346,12 @@ class RuntimeLogWindow:
         offline_line, rows, events = self.monitor.snapshot()
         self.status_var.set(offline_line)
 
-        for cav_id, mode, block, raw_v, sim_v, cap, flags, solver, age in rows:
+        for cav_id, avoid_text, mode, block, raw_v, sim_v, cap, flags, solver, age in rows:
             self.table.item(
                 f"cav{cav_id:02d}",
                 values=(
                     cav_id,
+                    avoid_text,
                     mode,
                     block,
                     _fmt_float(raw_v, 3),
@@ -341,18 +369,55 @@ class RuntimeLogWindow:
     def run(self) -> None:
         self.root.mainloop()
 
+    def close(self) -> None:
+        try:
+            self.root.quit()
+        except Exception:
+            pass
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+
 
 def main(args=None) -> None:
     rclpy.init(args=args)
     monitor = RuntimeLogMonitor()
 
-    spin_thread = threading.Thread(target=rclpy.spin, args=(monitor,), daemon=True)
+    def _spin() -> None:
+        try:
+            rclpy.spin(monitor)
+        except (KeyboardInterrupt, ExternalShutdownException):
+            pass
+
+    spin_thread = threading.Thread(target=_spin, daemon=True)
     spin_thread.start()
+
+    shutdown_requested = threading.Event()
+    window = None
+
+    def _request_shutdown(*_args) -> None:
+        if shutdown_requested.is_set():
+            return
+        shutdown_requested.set()
+        if window is not None:
+            try:
+                window.root.after(0, window.close)
+            except Exception:
+                window.close()
+        if rclpy.ok():
+            rclpy.shutdown()
 
     try:
         window = RuntimeLogWindow(monitor)
+        signal.signal(signal.SIGINT, _request_shutdown)
+        signal.signal(signal.SIGTERM, _request_shutdown)
         window.run()
+    except KeyboardInterrupt:
+        _request_shutdown()
     finally:
+        if window is not None:
+            window.close()
         monitor.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()

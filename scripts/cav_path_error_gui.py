@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+import signal
 import threading
 import time
 from dataclasses import dataclass, field
@@ -12,6 +13,7 @@ from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Path
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+from rclpy.executors import ExternalShutdownException
 from std_msgs.msg import String
 
 import matplotlib.pyplot as plt
@@ -671,14 +673,35 @@ def main(args=None):
     rclpy.init(args=args)
     node = CAVPathErrorMonitor()
 
-    spin_thread = threading.Thread(target=rclpy.spin, args=(node,), daemon=True)
+    def _spin() -> None:
+        try:
+            rclpy.spin(node)
+        except (KeyboardInterrupt, ExternalShutdownException):
+            pass
+
+    spin_thread = threading.Thread(target=_spin, daemon=True)
     spin_thread.start()
 
     _gui = PathErrorGUI(node)
+    shutdown_requested = threading.Event()
+
+    def _request_shutdown(*_args) -> None:
+        if shutdown_requested.is_set():
+            return
+        shutdown_requested.set()
+        plt.close("all")
+        if rclpy.ok():
+            rclpy.shutdown()
+
+    signal.signal(signal.SIGINT, _request_shutdown)
+    signal.signal(signal.SIGTERM, _request_shutdown)
 
     try:
         plt.show()
+    except KeyboardInterrupt:
+        _request_shutdown()
     finally:
+        plt.close("all")
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()

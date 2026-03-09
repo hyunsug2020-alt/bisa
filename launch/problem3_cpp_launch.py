@@ -45,6 +45,128 @@ def resolve_mpc_node_params(full_config, cav_id, slot_index):
         return full_config[yaml_section_fallback].get("ros__parameters", {})
     return {}
 
+
+def resolve_ltv_obstacle_params(tracker_params):
+    allowed_keys = {
+        "horizon",
+        "time_step",
+        "wheelbase",
+        "max_velocity",
+        "min_velocity",
+        "Q_pos",
+        "Q_heading",
+        "weight_curvature",
+        "weight_input",
+        "kappa_min",
+        "kappa_max",
+        "u_min",
+        "u_max",
+        "max_omega_abs",
+        "max_omega_rate",
+        "kappa_blend_alpha",
+        "kappa_blend_alpha_obs",
+        "ref_preview_steps",
+        "lateral_bound",
+        "w_lateral_slack_lin",
+        "w_lateral_slack_quad",
+        "osqp_max_iter",
+        "osqp_eps_abs",
+        "osqp_eps_rel",
+        "osqp_polish",
+        "sigmoid_tau_accel",
+        "sigmoid_tau_decel",
+        "d_safe",
+        "detect_range_s",
+        "obs_body_length",
+        "obs_body_width",
+        "obs_s_margin",
+        "activation_sigma_s",
+        "activation_back_s",
+        "activation_front_s",
+        "activation_ramp_s",
+        "extra_push",
+        "road_d_upper",
+        "road_d_lower",
+        "near_slowdown_s",
+        "near_release_s",
+        "near_speed",
+        "max_v_rate_up",
+        "max_v_rate_down",
+        "post_obs_recenter_sec",
+        "post_obs_kappa_blend",
+        "post_obs_max_speed",
+        "return_enter_cte",
+        "return_exit_cte",
+        "return_speed",
+        "return_heading_gain",
+        "return_cte_gain",
+        "return_max_omega",
+        "return_blend",
+        "oscillation_guard_enable",
+        "oscillation_cte_deadband",
+        "oscillation_heading_deadband",
+        "oscillation_damping",
+        "overshoot_guard_distance",
+        "overshoot_damping",
+    }
+    params = {k: v for k, v in tracker_params.items() if k in allowed_keys}
+    if "max_v_rate" in tracker_params:
+        params.setdefault("max_v_rate_up", tracker_params["max_v_rate"])
+        params.setdefault("max_v_rate_down", tracker_params["max_v_rate"])
+    if "obstacle_body_length" in tracker_params:
+        params.setdefault("obs_body_length", tracker_params["obstacle_body_length"])
+    if "obstacle_body_width" in tracker_params:
+        params.setdefault("obs_body_width", tracker_params["obstacle_body_width"])
+    if "obstacle_body_s_margin" in tracker_params:
+        params.setdefault("obs_s_margin", tracker_params["obstacle_body_s_margin"])
+    if "obstacle_sigma_s" in tracker_params:
+        params.setdefault("activation_sigma_s", tracker_params["obstacle_sigma_s"])
+    if "obstacle_activation_back_s" in tracker_params:
+        params.setdefault("activation_back_s", tracker_params["obstacle_activation_back_s"])
+    if "obstacle_activation_front_s" in tracker_params:
+        params.setdefault("activation_front_s", tracker_params["obstacle_activation_front_s"])
+    if "obstacle_activation_ramp_s" in tracker_params:
+        params.setdefault("activation_ramp_s", tracker_params["obstacle_activation_ramp_s"])
+    if "obstacle_extra_push" in tracker_params:
+        params.setdefault("extra_push", tracker_params["obstacle_extra_push"])
+    if "obstacle_near_slowdown_s" in tracker_params:
+        params.setdefault("near_slowdown_s", tracker_params["obstacle_near_slowdown_s"])
+    if "obstacle_near_release_s" in tracker_params:
+        params.setdefault("near_release_s", tracker_params["obstacle_near_release_s"])
+    if "obstacle_near_speed" in tracker_params:
+        params.setdefault("near_speed", tracker_params["obstacle_near_speed"])
+    if "kappa_blend_alpha_obstacle" in tracker_params:
+        params.setdefault("kappa_blend_alpha_obs", tracker_params["kappa_blend_alpha_obstacle"])
+    if "post_obstacle_recenter_sec" in tracker_params:
+        params.setdefault("post_obs_recenter_sec", tracker_params["post_obstacle_recenter_sec"])
+    if "post_obstacle_kappa_blend_alpha" in tracker_params:
+        params.setdefault("post_obs_kappa_blend", tracker_params["post_obstacle_kappa_blend_alpha"])
+    if "post_obstacle_max_speed" in tracker_params:
+        params.setdefault("post_obs_max_speed", tracker_params["post_obstacle_max_speed"])
+    if "return_recovery_enter_cte" in tracker_params:
+        params.setdefault("return_enter_cte", tracker_params["return_recovery_enter_cte"])
+    if "return_recovery_exit_cte" in tracker_params:
+        params.setdefault("return_exit_cte", tracker_params["return_recovery_exit_cte"])
+    if "return_recovery_speed" in tracker_params:
+        params.setdefault("return_speed", tracker_params["return_recovery_speed"])
+    if "return_recovery_heading_gain" in tracker_params:
+        params.setdefault("return_heading_gain", tracker_params["return_recovery_heading_gain"])
+    if "return_recovery_cte_gain" in tracker_params:
+        params.setdefault("return_cte_gain", tracker_params["return_recovery_cte_gain"])
+    if "return_recovery_max_omega" in tracker_params:
+        params.setdefault("return_max_omega", tracker_params["return_recovery_max_omega"])
+    if "return_recovery_blend" in tracker_params:
+        params.setdefault("return_blend", tracker_params["return_recovery_blend"])
+    if "oscillation_guard_cte_deadband" in tracker_params:
+        params.setdefault("oscillation_cte_deadband", tracker_params["oscillation_guard_cte_deadband"])
+    if "oscillation_guard_heading_deadband" in tracker_params:
+        params.setdefault("oscillation_heading_deadband", tracker_params["oscillation_guard_heading_deadband"])
+    if "oscillation_guard_reverse_damping" in tracker_params:
+        params.setdefault("oscillation_damping", tracker_params["oscillation_guard_reverse_damping"])
+    if "overshoot_reverse_damping" in tracker_params:
+        params.setdefault("overshoot_damping", tracker_params["overshoot_reverse_damping"])
+    return params
+
 def generate_launch_description():
     pkg_dir = get_package_share_directory("bisa")
     
@@ -61,6 +183,13 @@ def generate_launch_description():
         ros_params_dict = full_config["/**"]["ros__parameters"]
     except KeyError:
         ros_params_dict = {"cav_ids": [1, 2, 3, 4]}
+
+    drive_cav_ids = {
+        int(v) for v in ros_params_dict.get("drive_cav_ids", [1])
+    }
+    use_ltv_obstacle_avoidance = bool(
+        ros_params_dict.get("use_ltv_obstacle_avoidance", True)
+    )
 
     hv_settings = full_config.get("hv_settings", [])
     
@@ -118,6 +247,9 @@ def generate_launch_description():
     # 4. 동적 CAV 차량 노드 생성
     # ---------------------------------------------------------
     active_ids = ros_params_dict.get("cav_ids", [1, 2, 3, 4])
+    driving_ids = [cav_id for cav_id in active_ids if cav_id in drive_cav_ids]
+    stationary_ids = [cav_id for cav_id in active_ids if cav_id not in drive_cav_ids]
+    ltv_obstacle_ready = use_ltv_obstacle_avoidance and 1 in active_ids and 2 in active_ids
 
     # ---------------------------------------------------------
     # 4-1. Runtime monitor GUIs
@@ -152,6 +284,23 @@ def generate_launch_description():
         )
     )
 
+    if stationary_ids and not ltv_obstacle_ready:
+        nodes.append(
+            Node(
+                package="bisa",
+                executable="zero_accel_pub.py",
+                name="zero_accel_pub",
+                output="screen",
+                parameters=[
+                    {
+                        "cav_ids": stationary_ids,
+                        "publish_hz": 20.0,
+                    }
+                ],
+                additional_env={"ROS_DOMAIN_ID": "100"},
+            )
+        )
+
     # CAV 경로 설정 데이터 수에 맞춰 반복 (최대 4대)
     loop_count = min(len(active_ids), len(CAV_PATH_SETTINGS))
     cav_specs = []
@@ -169,37 +318,40 @@ def generate_launch_description():
         )
 
     if cav_specs:
-        scheduler_cav_ids = [spec["cav_id"] for spec in cav_specs]
+        scheduler_cav_ids = [spec["cav_id"] for spec in cav_specs if spec["cav_id"] in drive_cav_ids]
         nominal_speed_entries = []
         for spec in cav_specs:
             cav_id = spec["cav_id"]
+            if cav_id not in drive_cav_ids:
+                continue
             node_params = spec["node_params"]
             nominal_speed = float(node_params.get("max_velocity", 0.55))
             nominal_speed_entries.append(f"{int(cav_id)}:{nominal_speed:.3f}")
-        nodes.append(
-            Node(
-                package="bisa",
-                executable="offline_speed_scheduler",
-                name="offline_speed_scheduler",
-                output="screen",
-                parameters=[
-                    {
-                        "cav_ids": scheduler_cav_ids,
-                        "default_speed_mps": 0.55,
-                        "nominal_speed_entries": nominal_speed_entries,
-                        "conflict_distance": 0.60,
-                        "heading_conflict_min_deg": 12.0,
-                        "zone_merge_distance": 0.75,
-                        "zone_half_window_m": 0.65,
-                        "safety_margin_sec": 1.80,
-                        "max_start_delay_sec": 35.0,
-                        "publish_hz": 10.0,
-                        "plan_timeout_sec": 10.0,
-                    }
-                ],
-                additional_env={"ROS_DOMAIN_ID": "100"},
+        if scheduler_cav_ids and not ltv_obstacle_ready:
+            nodes.append(
+                Node(
+                    package="bisa",
+                    executable="offline_speed_scheduler",
+                    name="offline_speed_scheduler",
+                    output="screen",
+                    parameters=[
+                        {
+                            "cav_ids": scheduler_cav_ids,
+                            "default_speed_mps": 0.55,
+                            "nominal_speed_entries": nominal_speed_entries,
+                            "conflict_distance": 0.60,
+                            "heading_conflict_min_deg": 12.0,
+                            "zone_merge_distance": 0.75,
+                            "zone_half_window_m": 0.65,
+                            "safety_margin_sec": 1.80,
+                            "max_start_delay_sec": 35.0,
+                            "publish_hz": 10.0,
+                            "plan_timeout_sec": 10.0,
+                        }
+                    ],
+                    additional_env={"ROS_DOMAIN_ID": "100"},
+                )
             )
-        )
 
     for spec in cav_specs:
         index = spec["index"]
@@ -257,6 +409,22 @@ def generate_launch_description():
         )
 
         # (C) MPC Path Tracker
+        if ltv_obstacle_ready and cav_id == 1:
+            nodes.append(
+                Node(
+                    package="bisa",
+                    executable="ltv_obstacle_avoidance_node",
+                    name="ltv_obstacle_avoidance",
+                    output="screen",
+                    parameters=[resolve_ltv_obstacle_params(node_params)],
+                    additional_env={"ROS_DOMAIN_ID": "100"},
+                )
+            )
+            continue
+
+        if cav_id not in drive_cav_ids:
+            continue
+
         nodes.append(
             Node(
                 package="bisa",
@@ -281,7 +449,7 @@ def generate_launch_description():
         priority_gate_param_files.append(
             {
                 "cav_id": cav_id,
-                "active_cav_ids": active_ids,
+                "active_cav_ids": driving_ids,
                 # Offline-schedule first, gate logic as runtime fallback.
                 "ttc_mode_enabled": False,
                 "ttc_threshold_sec": 3.0,

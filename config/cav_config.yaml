@@ -16,6 +16,13 @@
     - 3
     - 4
 
+    # CAVs that actually run tracker/gate nodes. Others publish zero speed only.
+    drive_cav_ids:
+    - 1
+
+    # Run the direct CAV1-vs-CAV2 obstacle avoidance node instead of tracker+gate.
+    use_ltv_obstacle_avoidance: true
+
     # Legacy priority list (kept for compatibility with older tooling).
     high_priority_ids:
     - 1
