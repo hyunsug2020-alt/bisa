@@ -68,7 +68,7 @@ int LTVModel::findClosestIndex(
     const double d2 = dx * dx + dy * dy;
     // Keep moderate forward bias (too low: backward jump risk, too high:
     // misses true closest near sharp corners).
-    const double score = d2 + 0.012 * static_cast<double>(i);
+    const double score = d2 + 0.06 * static_cast<double>(i);
     if (score < best) {
       best = score;
       best_idx = static_cast<int>(i);
@@ -107,14 +107,25 @@ void LTVModel::buildReferenceProfiles(
 
   const int closest = findClosestIndex(ego_pose, path);
   const int last_idx = static_cast<int>(path.size()) - 1;
+  const int curvature_span = 5;
+  double local_kappa = 0.0;
+  if (closest >= curvature_span && closest + curvature_span <= last_idx) {
+    const auto& p0 = path[closest - curvature_span].pose.position;
+    const auto& p1 = path[closest].pose.position;
+    const auto& p2 = path[closest + curvature_span].pose.position;
+    local_kappa =
+        std::abs(curvature3pt(p0.x, p0.y, p1.x, p1.y, p2.x, p2.y));
+  }
+  const int effective_preview =
+      (local_kappa > 0.12) ? 0 : std::max(0, cfg_.ref_preview_steps);
   const int start_idx =
-      std::min(last_idx, std::max(0, closest + std::max(0, cfg_.ref_preview_steps)));
+      std::min(last_idx, std::max(0, closest + effective_preview));
 
   for (int k = 0; k <= N; ++k) {
     const int idx = std::min(start_idx + k, last_idx);
-    const int i0 = std::max(0, idx - 1);
+    const int i0 = std::max(0, idx - curvature_span);
     const int i1 = idx;
-    const int i2 = std::min(last_idx, idx + 1);
+    const int i2 = std::min(last_idx, idx + curvature_span);
 
     theta_r_seq[k] = referenceYawAt(path, idx);
     kappa_r_seq[k] = curvature3pt(path[i0].pose.position.x, path[i0].pose.position.y,
@@ -143,7 +154,7 @@ void LTVModel::buildReferenceProfiles(
     z_bar(k) = std::clamp(z_raw, -z_limit, z_limit);
 
     const double curvature = std::abs(kappa_smoothed[k]);
-    const double v = cfg_.max_velocity / (1.0 + 1.0 * curvature);
+    const double v = cfg_.max_velocity / (1.0 + 4.0 * curvature);
     v_bar(k) = std::max(cfg_.min_velocity, std::min(v, cfg_.max_velocity));
   }
 
@@ -154,13 +165,14 @@ void LTVModel::buildReferenceProfiles(
   const double y_ref = path[idx0].pose.position.y;
   const double theta = quatToYaw(ego_pose.orientation);
   const double theta_r = theta_r_seq[0];
+  const double theta_aligned = theta_r + wrapAngle(theta - theta_r);
 
   const double dx = x_ego - x_ref;
   const double dy = y_ego - y_ref;
   const double dr = -std::sin(theta_r) * dx + std::cos(theta_r) * dy;
 
   x0(0) = dr;
-  x0(1) = theta;
+  x0(1) = theta_aligned;
   x0(2) = current_kappa;
   x0(3) = theta_r;
   x0(4) = kappa_r_seq[0];

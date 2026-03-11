@@ -536,14 +536,6 @@ class LtvObstacleAvoidanceNode : public rclcpp::Node {
         (!obs.detected) && ((post_obs_until_ - now).seconds() > 0.0);
     prev_obs_detected_ = obs.detected;
 
-    if (!kappa_r_seq.empty()) {
-      const double kappa_ref =
-          std::clamp(kappa_r_seq[0], mpc_cfg_.kappa_min, mpc_cfg_.kappa_max);
-      double alpha = kappa_blend_alpha_;
-      if (obs.detected) alpha = kappa_blend_alpha_obs_;
-      else if (post_obs_mode) alpha = std::max(alpha, post_obs_kappa_blend_);
-      kappa_state_ = (1.0 - alpha) * kappa_state_ + alpha * kappa_ref;
-    }
     kappa_state_ =
         std::clamp(kappa_state_, mpc_cfg_.kappa_min, mpc_cfg_.kappa_max);
 
@@ -576,7 +568,7 @@ class LtvObstacleAvoidanceNode : public rclcpp::Node {
       } else if (return_latched_ && std::abs(signed_cte) < return_exit_cte_) {
         return_latched_ = false;
       }
-    } else if (obs.detected) {
+    } else {
       return_latched_ = false;
     }
 

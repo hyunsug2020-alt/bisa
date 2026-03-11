@@ -110,6 +110,7 @@ mpc_tracker_cav01:
     kappa_limit_ref_velocity: 0.28
     max_omega_abs: 2.30
     max_omega_rate: 45.0
+    kappa_blend_alpha: 0.70
     max_v_rate: 2.2
     sigmoid_tau_accel: 0.40
     sigmoid_tau_decel: 0.20
