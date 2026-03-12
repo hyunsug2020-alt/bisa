@@ -672,7 +672,26 @@ void MPCPathTrackerCpp::control_loop() {
             }
         }
 
-        if (adaptive_corner_mode_enable_) {
+        // Post-curve recovery guard:
+        // detect curve-exit transition after high heading error and keep
+        // full correction for a short window.
+        {
+            const double h_abs_now = std::abs(heading_error_near);
+            const double now_sec = this->now().seconds();
+
+            if (!post_curve_active_ && prev_heading_abs_ > 0.28 &&
+                h_abs_now < prev_heading_abs_) {
+                post_curve_active_ = true;
+                post_curve_exit_time_ = now_sec;
+            }
+            if (post_curve_active_ &&
+                (now_sec - post_curve_exit_time_) > post_curve_window_sec_) {
+                post_curve_active_ = false;
+            }
+            prev_heading_abs_ = h_abs_now;
+        }
+
+        if (adaptive_corner_mode_enable_ && !post_curve_active_) {
             const bool near_path =
                 (std::abs(signed_cte) < adaptive_near_cte_thresh_) &&
                 (std::abs(heading_error_near) < adaptive_near_heading_thresh_);

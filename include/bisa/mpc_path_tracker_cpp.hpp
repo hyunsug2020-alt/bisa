@@ -101,6 +101,11 @@ private:
     double off_path_recovery_cte_gain_ = 1.6;
     double off_path_recovery_max_omega_ = 1.6;
     bool off_path_recovery_latched_ = false;
+    // Post-curve heading recovery guard state.
+    bool post_curve_active_ = false;
+    double post_curve_exit_time_ = 0.0;
+    double post_curve_window_sec_ = 1.8;
+    double prev_heading_abs_ = 0.0;
     bool has_prev_errors_ = false;
     double prev_signed_cte_ = 0.0;
     double prev_heading_error_ = 0.0;

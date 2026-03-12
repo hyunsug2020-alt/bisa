@@ -100,7 +100,7 @@ mpc_tracker_cav01:
   ros__parameters:
     time_step: 0.05
     Q_pos: 130.0
-    Q_heading: 140.0
+    Q_heading: 165.0
     weight_curvature: 1.5
     weight_input: 0.18
     max_velocity: 0.744
@@ -114,7 +114,7 @@ mpc_tracker_cav01:
     max_v_rate: 2.2
     sigmoid_tau_accel: 0.40
     sigmoid_tau_decel: 0.20
-    ref_preview_steps: 14
+    ref_preview_steps: 7
     lateral_bound: 0.20
     w_lateral_slack_lin: 3000.0
     w_lateral_slack_quad: 35000.0
@@ -144,12 +144,12 @@ mpc_tracker_cav01:
     overshoot_reverse_damping: 0.52
     oscillation_guard_enable: true
     oscillation_guard_cte_deadband: 0.08
-    oscillation_guard_heading_deadband: 0.20
+    oscillation_guard_heading_deadband: 0.10
     oscillation_guard_reverse_damping: 0.70
     adaptive_corner_mode_enable: true
-    adaptive_near_cte_thresh: 0.14
-    adaptive_near_heading_thresh: 0.14
-    adaptive_near_omega_damping: 0.55
+    adaptive_near_cte_thresh: 0.07
+    adaptive_near_heading_thresh: 0.07
+    adaptive_near_omega_damping: 0.82
     adaptive_near_omega_rate_scale: 0.55
     adaptive_near_v_scale: 0.97
     off_path_recovery_enable: true
