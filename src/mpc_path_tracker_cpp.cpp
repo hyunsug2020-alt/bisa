@@ -313,7 +313,8 @@ void MPCPathTrackerCpp::update_controller_params() {
   // ── DBMRTINMPCController 직접 접근 (legacy_controller_ 내부) ─
   // wrapper의 dbm_params_ 업데이트
   if (legacy_controller_) {
-    // LTVMPCParams를 통해 기본값 전달 후, DBM 전용 파라미터는
+    if (legacy_controller_) legacy_controller_->setDBMParams(dbm);
+  // LTVMPCParams를 통해 기본값 전달 후, DBM 전용 파라미터는
     // setEstimatedState처럼 별도 setter를 통해 전달
     // (여기서는 LTVMPCParams를 DBM 파라미터와 동일하게 매핑)
     lp.wd    = dbm.w_xy;

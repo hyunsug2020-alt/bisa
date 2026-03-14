@@ -693,6 +693,11 @@ void MPCControllerCpp::reset_state() {
   est_delta_ = est_omegaf_ = est_omegar_ = 0.0;
 }
 
+void MPCControllerCpp::setDBMParams(const DBMRTINMPCParams& p) {
+  dbm_params_ = p;
+  dbm_ctrl_.setConfig(dbm_params_);
+}
+
 void MPCControllerCpp::setEstimatedState(
     double vx, double vy, double omega,
     double delta_c, double omega_f, double omega_r)

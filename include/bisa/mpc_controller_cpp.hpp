@@ -196,6 +196,7 @@ public:
     const CollisionConstraints& constraints = CollisionConstraints());
 
   // 상태 주입 (tracker에서 추정값 전달용)
+  void setDBMParams(const DBMRTINMPCParams& params);
   void setEstimatedState(double vx, double vy, double omega,
                          double delta_c, double omega_f, double omega_r);
 

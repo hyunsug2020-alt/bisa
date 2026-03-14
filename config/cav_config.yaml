@@ -164,6 +164,7 @@ mpc_tracker_cav01:
 mpc_tracker_cav02:
   ros__parameters:
     time_step: 0.05
+    use_ltv_mpc: false
     Q_pos: 100.0
     Q_heading: 108.0
     weight_curvature: 2.0
@@ -190,6 +191,7 @@ mpc_tracker_cav02:
 mpc_tracker_cav03:
   ros__parameters:
     time_step: 0.05
+    use_ltv_mpc: false
     Q_pos: 100.0
     Q_heading: 108.0
     weight_curvature: 2.0
@@ -216,6 +218,7 @@ mpc_tracker_cav03:
 mpc_tracker_cav04:
   ros__parameters:
     time_step: 0.05
+    use_ltv_mpc: false
     Q_pos: 100.0
     Q_heading: 108.0
     weight_curvature: 2.0
