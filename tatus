@@ -1,0 +1,58 @@
+[33mcommit 6cc75da9da8992b8d46f5a515a4b7fb9c3a03c13[m[33m ([m[1;36mHEAD[m[33m)[m
+Author: hyunsug2020-alt <hyunsug2020@gmail.com>
+Date:   Mon Mar 9 18:16:22 2026 +0900
+
+    Initial bisa package import
+
+ .gitignore                            |      5 [32m+[m
+ CMakeLists.txt                        |    216 [32m+[m
+ config/cav_config.yaml                |    245 [32m+[m
+ config/priority_gate_cav01.yaml       |     14 [32m+[m
+ config/priority_gate_cav02.yaml       |     14 [32m+[m
+ config/priority_gate_cav03.yaml       |     14 [32m+[m
+ config/priority_gate_cav04.yaml       |     14 [32m+[m
+ config/priority_gate_common.yaml      |     60 [32m+[m
+ config/test_scenarios.yaml            |     39 [32m+[m
+ hdmap_data/global_info.json           |     11 [32m+[m
+ hdmap_data/link_set.json              | 108624 [32m+++++++++++++++++++++++++++++++[m
+ hdmap_data/node_set.json              |    632 [32m+[m
+ include/bisa/local_path_pub_cpp.hpp   |     62 [32m+[m
+ include/bisa/mpc_controller_cpp.hpp   |    217 [32m+[m
+ include/bisa/mpc_path_tracker_cpp.hpp |    116 [32m+[m
+ launch/problem3_cpp_launch.py         |    345 [32m+[m
+ msg/LapInfo.msg                       |      6 [32m+[m
+ msg/MPCPerformance.msg                |      9 [32m+[m
+ msg/ZoneReservation.msg               |      6 [32m+[m
+ package.xml                           |     35 [32m+[m
+ resource/bisa                         |      0
+ rviz/bisa.rviz                        |    492 [32m+[m
+ rviz/hdmap_view.rviz                  |     55 [32m+[m
+ scripts/__init__.py                   |      0
+ scripts/analyze_mpc_performance.py    |     81 [32m+[m
+ scripts/cav_path_error_gui.py         |    689 [32m+[m
+ scripts/cav_runtime_log_gui.py        |    363 [32m+[m
+ scripts/collision_avoidance_node.py   |    766 [32m+[m
+ scripts/dijkstra_planner.py           |    138 [32m+[m
+ scripts/global_path_pub.py            |    168 [32m+[m
+ scripts/global_path_pub_multi.py      |    177 [32m+[m
+ scripts/hdmap_generator.py            |    226 [32m+[m
+ scripts/hdmap_visualizer.py           |    147 [32m+[m
+ scripts/mgeo_class_defs.py            |     77 [32m+[m
+ scripts/test_collision_scenarios.py   |    146 [32m+[m
+ src/local_path_pub_cpp.cpp            |    463 [32m+[m
+ src/ltv_mpc/ltv_cost.cpp              |     57 [32m+[m
+ src/ltv_mpc/ltv_cost.hpp              |     29 [32m+[m
+ src/ltv_mpc/ltv_model.cpp             |    259 [32m+[m
+ src/ltv_mpc/ltv_model.hpp             |     61 [32m+[m
+ src/ltv_mpc/ltv_mpc.cpp               |    330 [32m+[m
+ src/ltv_mpc/ltv_mpc.hpp               |     59 [32m+[m
+ src/ltv_mpc/ltv_solver.cpp            |     99 [32m+[m
+ src/ltv_mpc/ltv_solver.hpp            |     35 [32m+[m
+ src/ltv_mpc/ltv_types.hpp             |     59 [32m+[m
+ src/mpc_controller_cpp.cpp            |    830 [32m+[m
+ src/mpc_obstacle_avoidance_cpp.cpp    |   1281 [32m+[m
+ src/mpc_path_tracker_cpp.cpp          |    798 [32m+[m
+ src/offline_speed_scheduler.cpp       |    465 [32m+[m
+ src/priority_collision_gate.cpp       |   1752 [32m+[m
+ src/test_osqp.cpp                     |     76 [32m+[m
+ 51 files changed, 120862 insertions(+)
