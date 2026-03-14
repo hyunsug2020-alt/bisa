@@ -1,830 +1,753 @@
+// ============================================================
+// mpc_controller_cpp.cpp  (bisa)
+//
+// Wagner & Normey-Rico (2024) arXiv:2410.12170
+// 9-state Dynamic Bicycle Model RTI-NMPC
+//
+// 논문 구현 대응:
+//   식(1)      ẋ = f(x, u)           → dbmF()
+//   식(2)(8)   Implicit Euler         → dbmImplicitEuler()
+//   식(10)     이산 Jacobian Ad, Bd   → 솔버 내부
+//              Ad = (I - Ac·dt)^{-1}  (Implicit Euler)
+//              Bd = Ad · Bc · dt
+//   식(11)     선형화 전개 (A0,A1,B)  → A_batch, B_batch, F_batch
+//   식(12-14)  Ac = ∂f/∂x, Bc = ∂f/∂u → dbmJacobian()
+//   식(15)     δx 동역학              → QP 내부
+//   식(16-19)  G(x,u) 제약 선형화    → frictionCircleJacobian()
+//   식(20)     최종 QP               → OSQP
+//   식(25-27)  DBM + 바퀴 동역학     → dbmF()
+//   식(28-29)  선형 타이어 모델       → computeTireForces()
+//   식(30)     마찰원 제약            → A_fc 블록
+// ============================================================
 #include "bisa/mpc_controller_cpp.hpp"
-#include <unsupported/Eigen/MatrixFunctions>  // expm
+
 #include <algorithm>
 #include <cmath>
+#include <limits>
+#include <vector>
+#include <chrono>
 
 namespace bisa {
 
-MPCControllerCpp::MPCControllerCpp() {
-    current_kappa_ = 0.0;
+static constexpr double kPi = 3.14159265358979323846;
+
+// ============================================================
+// DBMRTINMPCController
+// ============================================================
+DBMRTINMPCController::DBMRTINMPCController(const DBMRTINMPCParams& p)
+  : params_(p) {}
+
+void DBMRTINMPCController::setConfig(const DBMRTINMPCParams& p) {
+  params_ = p;
+  warm_valid_ = false;
+  warm_u_.clear();
+  warm_x_.clear();
 }
 
-MPCControllerCpp::~MPCControllerCpp() {}
+void DBMRTINMPCController::reset() {
+  warm_valid_ = false;
+  warm_u_.clear();
+  warm_x_.clear();
+}
 
-void MPCControllerCpp::update_parameters(const LTVMPCParams& params) {
-    params_ = params;
+double DBMRTINMPCController::wrapAngle(double a) {
+  while (a >  kPi) { a -= 2.0 * kPi; }
+  while (a < -kPi) { a += 2.0 * kPi; }
+  return a;
+}
+
+// ============================================================
+// 타이어 힘 계산 (논문 식 28-29)
+// Flon = Cs * σ,  Flat = Ca * α
+// ============================================================
+TireForces DBMRTINMPCController::computeTireForces(
+    const Eigen::Matrix<double,9,1>& x) const
+{
+  const double vx    = x(3);
+  const double vy    = x(4);
+  const double omega = x(5);
+  const double dc    = x(6);
+  const double wf    = x(7);
+  const double wr    = x(8);
+
+  TireForces t;
+  t.v_safe  = std::max(std::abs(vx), params_.v_min_mps);
+  t.denom_f = t.v_safe * t.v_safe + (vy + params_.lf_m * omega) * (vy + params_.lf_m * omega);
+  t.denom_r = t.v_safe * t.v_safe + (vy - params_.lr_m * omega) * (vy - params_.lr_m * omega);
+
+  // 슬립각 (논문 식 22)
+  t.alpha_f = dc - std::atan2(vy + params_.lf_m * omega, t.v_safe);
+  t.alpha_r =    - std::atan2(vy - params_.lr_m * omega, t.v_safe);
+
+  // 횡방향 힘 (논문 식 29)
+  t.Fy_f = params_.Ca_N_rad * t.alpha_f;
+  t.Fy_r = params_.Ca_N_rad * t.alpha_r;
+
+  // 종방향 슬립 (논문 식 23)
+  t.sigma_f = (wf * params_.r_w_m - vx) / t.v_safe;
+  t.sigma_r = (wr * params_.r_w_m - vx) / t.v_safe;
+
+  // 종방향 힘 (논문 식 28)
+  t.Fx_f = params_.Cx_N * t.sigma_f;
+  t.Fx_r = params_.Cx_N * t.sigma_r;
+
+  // Jacobian용 편미분 (식 12-14에서 사용)
+  t.daf_dvy = -t.v_safe / t.denom_f;
+  t.daf_dom = -params_.lf_m * t.v_safe / t.denom_f;
+  t.dar_dvy = -t.v_safe / t.denom_r;
+  t.dar_dom =  params_.lr_m * t.v_safe / t.denom_r;
+
+  return t;
+}
+
+// ============================================================
+// 논문 식(26)(27): ẋ = f(x, u)
+//
+// x = [px, py, ψ, vx, vy, ω, δc, ωf, ωr]
+// u = [v_delta, T_drive]
+//
+// 전진/후진: vx 부호 그대로 유지
+// 앞바퀴: 토크 없음 (구동력 없음)
+// 뒷바퀴: T_drive 전달 (RWD)
+// ============================================================
+Eigen::Matrix<double,9,1> DBMRTINMPCController::dbmF(
+    const Eigen::Matrix<double,9,1>& x,
+    const Eigen::Matrix<double,2,1>& u) const
+{
+  const double psi    = x(2);
+  const double vx     = x(3);
+  const double vy     = x(4);
+  const double omega  = x(5);
+  const double dc     = x(6);
+  const double v_delta = u(0);
+  const double T_drive = u(1);
+
+  const double cos_d = std::cos(dc);
+  const double sin_d = std::sin(dc);
+
+  const auto t = computeTireForces(x);
+
+  Eigen::Matrix<double,9,1> xdot;
+  // 논문 식(26): DBM 동역학
+  xdot(0) =  vx * std::cos(psi) - vy * std::sin(psi);
+  xdot(1) =  vx * std::sin(psi) + vy * std::cos(psi);
+  xdot(2) =  omega;
+  xdot(3) = (2.0 * t.Fx_f * cos_d - 2.0 * t.Fy_f * sin_d + 2.0 * t.Fx_r)
+             / params_.mass_kg + vy * omega;
+  xdot(4) = (2.0 * t.Fx_f * sin_d + 2.0 * t.Fy_f * cos_d + 2.0 * t.Fy_r)
+             / params_.mass_kg - vx * omega;
+  xdot(5) = (2.0 * params_.lf_m * (t.Fx_f * sin_d + t.Fy_f * cos_d)
+             - 2.0 * params_.lr_m * t.Fy_r)
+             / params_.inertia_kgm2;
+  // 논문 식(25): δ̇c = v_delta  (steering-rate 입력)
+  xdot(6) = v_delta;
+  // 논문 식(27): 바퀴 동역학 (앞: 저항만, 뒤: 토크)
+  xdot(7) = (-params_.r_w_m * t.Fx_f) / params_.Jw_kgm2;
+  xdot(8) = (T_drive - params_.r_w_m * t.Fx_r) / params_.Jw_kgm2;
+
+  return xdot;
+}
+
+// ============================================================
+// 논문 식(12-14): Jacobian
+// Ac = ∂f/∂x (9×9),  Bc = ∂f/∂u (9×2)
+// ============================================================
+void DBMRTINMPCController::dbmJacobian(
+    const Eigen::Matrix<double,9,1>& x,
+    const Eigen::Matrix<double,2,1>& /*u*/,
+    Eigen::Matrix<double,9,9>& Ac,
+    Eigen::Matrix<double,9,2>& Bc) const
+{
+  const double psi   = x(2);
+  const double vx    = x(3);
+  const double vy    = x(4);
+  const double omega = x(5);
+  const double dc    = x(6);
+  const double cos_d = std::cos(dc);
+  const double sin_d = std::sin(dc);
+
+  const auto t = computeTireForces(x);
+  const double m   = params_.mass_kg;
+  const double Iz  = params_.inertia_kgm2;
+  const double lf  = params_.lf_m;
+  const double lr  = params_.lr_m;
+  const double Ca  = params_.Ca_N_rad;
+  const double Cx  = params_.Cx_N;
+  const double rw  = params_.r_w_m;
+  const double Jw  = params_.Jw_kgm2;
+  const double vs  = t.v_safe;
+
+  // Fy 편미분
+  const double dFyf_dvy = Ca * t.daf_dvy;
+  const double dFyf_dom = Ca * t.daf_dom;
+  const double dFyf_ddc = Ca;               // ∂α_f/∂δc = 1
+  const double dFyr_dvy = Ca * t.dar_dvy;
+  const double dFyr_dom = Ca * t.dar_dom;
+
+  // Fx 편미분 (v_safe 고정 근사)
+  const double dFxf_dvx = Cx * (-1.0 / vs);
+  const double dFxf_dwf = Cx * (rw / vs);
+  const double dFxr_dvx = Cx * (-1.0 / vs);
+  const double dFxr_dwr = Cx * (rw / vs);
+
+  Ac = Eigen::Matrix<double,9,9>::Zero();
+
+  // 행 0: ṗx = vx*cos(ψ) - vy*sin(ψ)
+  Ac(0,2) = -vx * std::sin(psi) - vy * std::cos(psi);
+  Ac(0,3) =  std::cos(psi);
+  Ac(0,4) = -std::sin(psi);
+
+  // 행 1: ṗy = vx*sin(ψ) + vy*cos(ψ)
+  Ac(1,2) =  vx * std::cos(psi) - vy * std::sin(psi);
+  Ac(1,3) =  std::sin(psi);
+  Ac(1,4) =  std::cos(psi);
+
+  // 행 2: ψ̇ = ω
+  Ac(2,5) = 1.0;
+
+  // 행 3: v̇x = (2Fxf*cos-2Fyf*sin+2Fxr)/m + vy*ω
+  Ac(3,3) = (2.0 * dFxf_dvx * cos_d + 2.0 * dFxr_dvx) / m;
+  Ac(3,4) = -2.0 * dFyf_dvy * sin_d / m + omega;
+  Ac(3,5) = -2.0 * dFyf_dom * sin_d / m + vy;
+  Ac(3,6) = 2.0 * (-t.Fx_f * sin_d - dFyf_ddc * sin_d - t.Fy_f * cos_d) / m;
+  Ac(3,7) =  2.0 * dFxf_dwf * cos_d / m;
+  Ac(3,8) =  2.0 * dFxr_dwr / m;
+
+  // 행 4: v̇y = (2Fxf*sin+2Fyf*cos+2Fyr)/m - vx*ω
+  Ac(4,3) = 2.0 * dFxf_dvx * sin_d / m - omega;
+  Ac(4,4) = 2.0 * (dFyf_dvy * cos_d + dFyr_dvy) / m;
+  Ac(4,5) = 2.0 * (dFyf_dom * cos_d + dFyr_dom) / m - vx;
+  Ac(4,6) = 2.0 * (t.Fx_f * cos_d + dFyf_ddc * cos_d - t.Fy_f * sin_d) / m;
+  Ac(4,7) =  2.0 * dFxf_dwf * sin_d / m;
+
+  // 행 5: ω̇ = (2lf*(Fxf*sin+Fyf*cos) - 2lr*Fyr)/Iz
+  Ac(5,3) = 2.0 * lf * dFxf_dvx * sin_d / Iz;
+  Ac(5,4) = 2.0 * (lf * dFyf_dvy * cos_d - lr * dFyr_dvy) / Iz;
+  Ac(5,5) = 2.0 * (lf * dFyf_dom * cos_d - lr * dFyr_dom) / Iz;
+  Ac(5,6) = 2.0 * lf * (t.Fx_f * cos_d + dFyf_ddc * cos_d - t.Fy_f * sin_d) / Iz;
+  Ac(5,7) =  2.0 * lf * dFxf_dwf * sin_d / Iz;
+
+  // 행 6: δ̇c = v_delta
+  // (모두 0 - v_delta는 입력이고 δc는 상태)
+
+  // 행 7: ω̇f = -r*Fxf/Jw
+  Ac(7,3) = -rw * dFxf_dvx / Jw;
+  Ac(7,7) = -rw * dFxf_dwf / Jw;
+
+  // 행 8: ω̇r = (T_drive - r*Fxr)/Jw
+  Ac(8,3) = -rw * dFxr_dvx / Jw;
+  Ac(8,8) = -rw * dFxr_dwr / Jw;
+
+  // Bc = ∂f/∂u (9×2)
+  Bc = Eigen::Matrix<double,9,2>::Zero();
+  Bc(6,0) = 1.0;                      // ∂δ̇c/∂v_delta = 1
+  Bc(8,1) = 1.0 / Jw;                 // ∂ω̇r/∂T_drive = 1/Jw
+}
+
+// ============================================================
+// 논문 식(2)(8): Implicit Euler  (fixed-point 1회)
+// x_{k+1} ← x_k + f(x^{(0)}_{k+1}, u_k)·dt
+// x^{(0)} = x_k + f(x_k, u_k)·dt  (Explicit 예측)
+// ============================================================
+Eigen::Matrix<double,9,1> DBMRTINMPCController::dbmImplicitEuler(
+    const Eigen::Matrix<double,9,1>& xk,
+    const Eigen::Matrix<double,2,1>& uk) const
+{
+  const double dt = params_.Ts;
+  Eigen::Matrix<double,9,1> x0 = xk + dbmF(xk, uk) * dt;
+  x0(2) = wrapAngle(x0(2));
+  Eigen::Matrix<double,9,1> x1 = xk + dbmF(x0, uk) * dt;
+  x1(2) = wrapAngle(x1(2));
+  return x1;
+}
+
+// ============================================================
+// 논문 식(16-19): 마찰원 제약 G(x,u) 선형화
+// G = Flat^2 + Flon^2 - (μmg)^2 ≤ 0
+// ∂G/∂x = D (2×9),  ∂G/∂u = E (2×2)
+// (앞바퀴/뒷바퀴 각각 1행씩)
+// ============================================================
+void DBMRTINMPCController::frictionCircleJacobian(
+    const Eigen::Matrix<double,9,1>& x,
+    const TireForces& t,
+    Eigen::Matrix<double,2,9>& D,
+    Eigen::Matrix<double,2,2>& E) const
+{
+  D = Eigen::Matrix<double,2,9>::Zero();
+  E = Eigen::Matrix<double,2,2>::Zero();
+
+  const double Ca  = params_.Ca_N_rad;
+  const double Cx  = params_.Cx_N;
+  const double rw  = params_.r_w_m;
+  const double vs  = t.v_safe;
+  const double dc  = x(6);
+  const double cos_d = std::cos(dc);
+  const double sin_d = std::sin(dc);
+
+  // ── 앞바퀴 (행 0) ─────────────────────────────────────────
+  // G_f = Fy_f^2 + Fx_f^2 - (μmg)^2
+  // ∂G_f/∂x_j = 2*Fy_f*∂Fy_f/∂x_j + 2*Fx_f*∂Fx_f/∂x_j
+  const double dFyf_dvy = Ca * t.daf_dvy;
+  const double dFyf_dom = Ca * t.daf_dom;
+  const double dFyf_ddc = Ca;
+  const double dFxf_dvx = Cx * (-1.0 / vs);
+  const double dFxf_dwf = Cx * (rw / vs);
+
+  D(0,3) = 2.0 * t.Fx_f * dFxf_dvx;
+  D(0,4) = 2.0 * t.Fy_f * dFyf_dvy;
+  D(0,5) = 2.0 * t.Fy_f * dFyf_dom;
+  D(0,6) = 2.0 * t.Fy_f * dFyf_ddc;
+  D(0,7) = 2.0 * t.Fx_f * dFxf_dwf;
+
+  // ── 뒷바퀴 (행 1) ─────────────────────────────────────────
+  const double dFyr_dvy = Ca * t.dar_dvy;
+  const double dFyr_dom = Ca * t.dar_dom;
+  const double dFxr_dvx = Cx * (-1.0 / vs);
+  const double dFxr_dwr = Cx * (rw / vs);
+
+  D(1,3) = 2.0 * t.Fx_r * dFxr_dvx;
+  D(1,4) = 2.0 * t.Fy_r * dFyr_dvy;
+  D(1,5) = 2.0 * t.Fy_r * dFyr_dom;
+  D(1,8) = 2.0 * t.Fx_r * dFxr_dwr;
+
+  // ∂G/∂u = E (2×2): 입력이 u=[v_delta, T_drive]
+  // v_delta → δc 상태 변화 → Fy_f 변화 (간접, δc통해)
+  // T_drive → ωr → Fx_r 변화 (간접)
+  // 직접 미분은 0 (입력이 가속도 형태이므로 1스텝 lag)
+  // 논문에서 E = ∂G/∂u → 입력에 대한 직접 편미분은 0
+  // (상태를 통한 간접 영향은 D·B로 처리됨)
+  (void)cos_d; (void)sin_d;
+}
+
+// ============================================================
+// 메인 솔버: computeControl
+// ============================================================
+DBMCommand DBMRTINMPCController::computeControl(
+    const DBMState& state,
+    const std::vector<geometry_msgs::msg::PoseStamped>& path,
+    double speed_mps)
+{
+  DBMCommand out;
+  const int N  = params_.N;
+  const int nx = 9;
+  const int nu = 2;
+  const double dt = params_.Ts;
+
+  if (N < 2 || static_cast<int>(path.size()) < 3) { return out; }
+
+  const auto t0 = std::chrono::high_resolution_clock::now();
+
+  // ── 현재 상태 벡터 ──────────────────────────────────────
+  Eigen::Matrix<double,9,1> x0;
+  x0 << state.px, state.py, state.psi,
+        state.vx, state.vy, state.omega,
+        state.delta_c, state.omega_f, state.omega_r;
+
+  // ── warm start 초기화 ────────────────────────────────────
+  const double dc_max    = params_.delta_c_max;
+  const double vd_max    = params_.v_delta_max;
+  const double T_max     = params_.T_drive_max;
+  const double omega_ref = speed_mps / std::max(params_.r_w_m, 0.01);
+
+  if (!warm_valid_ ||
+      static_cast<int>(warm_u_.size()) != N ||
+      static_cast<int>(warm_x_.size()) != N + 1)
+  {
+    warm_u_.resize(N);
+    for (int k = 0; k < N; ++k) {
+      warm_u_[k](0) = 0.0;
+      warm_u_[k](1) = 0.0;
+    }
+    warm_x_.resize(N + 1);
+    warm_x_[0] = x0;
+    for (int k = 0; k < N; ++k) {
+      warm_x_[k+1] = dbmImplicitEuler(warm_x_[k], warm_u_[k]);
+    }
+    warm_valid_ = true;
+  } else {
+    warm_x_[0] = x0;
+  }
+
+  // ── 참조 궤적 ────────────────────────────────────────────
+  const int path_n = static_cast<int>(path.size());
+  // 경로에서 가장 가까운 인덱스 찾기
+  int nearest_idx = 0;
+  double best_d2 = std::numeric_limits<double>::max();
+  for (int i = 0; i < std::min(path_n, 60); ++i) {
+    const double dx = path[i].pose.position.x - state.px;
+    const double dy = path[i].pose.position.y - state.py;
+    const double d2 = dx * dx + dy * dy;
+    if (d2 < best_d2) { best_d2 = d2; nearest_idx = i; }
+  }
+
+  std::vector<Eigen::Matrix<double,9,1>> x_ref(N);
+  const double omega_wref = std::abs(speed_mps) / std::max(params_.r_w_m, 0.01);
+  for (int k = 0; k < N; ++k) {
+    const int idx = std::min(nearest_idx + k, path_n - 1);
+    const double path_yaw = [&](){
+      int i0 = std::max(0, idx - 1);
+      int i1 = std::min(path_n - 1, idx + 1);
+      const double dx = path[i1].pose.position.x - path[i0].pose.position.x;
+      const double dy = path[i1].pose.position.y - path[i0].pose.position.y;
+      return (std::hypot(dx, dy) > 1e-9) ? std::atan2(dy, dx) : state.psi;
+    }();
+    x_ref[k](0) = path[idx].pose.position.x;
+    x_ref[k](1) = path[idx].pose.position.y;
+    x_ref[k](2) = path_yaw;
+    x_ref[k](3) = speed_mps;
+    x_ref[k](4) = 0.0;
+    x_ref[k](5) = 0.0;
+    x_ref[k](6) = 0.0;
+    x_ref[k](7) = omega_wref;
+    x_ref[k](8) = omega_wref;
+  }
+
+  // ── Jacobian 계산 및 이산화 (논문 식 10) ─────────────────
+  // Implicit Euler 이산화:
+  //   Ad = (I - Ac·dt)^{-1}
+  //   Bd = Ad · Bc · dt
+  using M99 = Eigen::Matrix<double,9,9>;
+  using M92 = Eigen::Matrix<double,9,2>;
+  using V9  = Eigen::Matrix<double,9,1>;
+  const M99 I9 = M99::Identity();
+
+  std::vector<M99> Ad(N);
+  std::vector<M92> Bd(N);
+  std::vector<V9>  fd(N);
+
+  for (int k = 0; k < N; ++k) {
+    const V9&  xg = warm_x_[k];
+    const Eigen::Matrix<double,2,1>& ug = warm_u_[k];
+
+    M99 Ac;
+    M92 Bc;
+    dbmJacobian(xg, ug, Ac, Bc);
+
+    // Implicit Euler 이산화
+    M99 lhs = I9 - Ac * dt;
+    M99 lhs_inv = lhs.inverse();
+    Ad[k] = lhs_inv;
+    Bd[k] = lhs_inv * (Bc * dt);
+
+    // affine 보정항
+    V9 fd_raw = warm_x_[k+1] - Ad[k] * xg - Bd[k] * ug;
+    fd_raw(2) = wrapAngle(fd_raw(2));
+    fd[k] = fd_raw;
+  }
+
+  // ── 배치 행렬 (논문 식 11-15) ────────────────────────────
+  const int Nx = nx * N;
+  const int Nu = nu * N;
+
+  Eigen::MatrixXd A_batch = Eigen::MatrixXd::Zero(Nx, nx);
+  Eigen::MatrixXd B_batch = Eigen::MatrixXd::Zero(Nx, Nu);
+  Eigen::VectorXd F_batch = Eigen::VectorXd::Zero(Nx);
+
+  M99 Phi = I9;
+  for (int k = 0; k < N; ++k) {
+    A_batch.block(k*nx, 0, nx, nx) = Phi;
+
+    if (k == 0) { F_batch.segment(0, nx) = fd[0]; }
+    else { F_batch.segment(k*nx, nx) = Ad[k] * F_batch.segment((k-1)*nx, nx) + fd[k]; }
+    F_batch.segment(k*nx, nx)(2) = wrapAngle(F_batch.segment(k*nx, nx)(2));
+
+    B_batch.block(k*nx, k*nu, nx, nu) = Bd[k];
+    for (int j = k+1; j < N; ++j) {
+      // 논문 식 15: Ad[j-1] 사용 (LTV 올바른 전파)
+      B_batch.block(j*nx, k*nu, nx, nu) =
+        Ad[j-1] * B_batch.block((j-1)*nx, k*nu, nx, nu);
+    }
+    Phi = Ad[k] * Phi;
+  }
+
+  // ── 비용 행렬 Q, R ────────────────────────────────────────
+  Eigen::VectorXd q_diag(nx);
+  q_diag << params_.w_xy, params_.w_xy, params_.w_psi,
+            params_.w_vx, params_.w_vy, params_.w_omega,
+            params_.w_delta_c, params_.w_wheel, params_.w_wheel;
+
+  Eigen::VectorXd r_diag(nu);
+  r_diag << params_.w_u_delta, params_.w_u_torque;
+
+  Eigen::MatrixXd Q = Eigen::MatrixXd::Zero(Nx, Nx);
+  Eigen::MatrixXd R = Eigen::MatrixXd::Zero(Nu, Nu);
+  for (int k = 0; k < N; ++k) {
+    Q.block(k*nx, k*nx, nx, nx) = q_diag.asDiagonal();
+    R.block(k*nu, k*nu, nu, nu) = r_diag.asDiagonal();
+  }
+
+  // ── delta 형식 QP ─────────────────────────────────────────
+  V9 delta_x0 = x0 - warm_x_[0];
+  delta_x0(2) = wrapAngle(delta_x0(2));
+
+  Eigen::VectorXd E_vec(Nx);
+  for (int k = 0; k < N; ++k) {
+    E_vec.segment(k*nx, nx) = warm_x_[k] - x_ref[k];
+    E_vec.segment(k*nx, nx)(2) = wrapAngle(E_vec.segment(k*nx, nx)(2));
+  }
+
+  Eigen::VectorXd eps = A_batch * delta_x0 + F_batch + E_vec;
+
+  Eigen::VectorXd Ug(Nu);
+  for (int k = 0; k < N; ++k) {
+    Ug(k*nu+0) = warm_u_[k](0);
+    Ug(k*nu+1) = warm_u_[k](1);
+  }
+
+  Eigen::MatrixXd H  = B_batch.transpose() * Q * B_batch + R;
+  Eigen::VectorXd gv = B_batch.transpose() * Q * eps + R * Ug;
+  H = 0.5 * (H + H.transpose());
+  H += 1e-8 * Eigen::MatrixXd::Identity(Nu, Nu);
+
+  // ── 제약 행렬 구성 (논문 식 20) ──────────────────────────
+  // 블록 1: 입력 박스   (Nu 행)
+  // 블록 2: δc 상태 박스 (N  행)
+  // 블록 3: 마찰원 선형 (2N 행) - 논문 식(30)
+  const int n_box   = Nu;
+  const int n_dc    = N;
+  const int n_fc    = 2 * N;
+  const int n_con   = n_box + n_dc + n_fc;
+
+  Eigen::MatrixXd A_con = Eigen::MatrixXd::Zero(n_con, Nu);
+  Eigen::VectorXd l_con = Eigen::VectorXd::Zero(n_con);
+  Eigen::VectorXd u_con = Eigen::VectorXd::Zero(n_con);
+
+  // 블록 1: 입력 박스
+  A_con.block(0, 0, Nu, Nu) = Eigen::MatrixXd::Identity(Nu, Nu);
+  for (int k = 0; k < N; ++k) {
+    l_con(k*nu+0) = -vd_max - warm_u_[k](0);
+    u_con(k*nu+0) =  vd_max - warm_u_[k](0);
+    l_con(k*nu+1) = -T_max  - warm_u_[k](1);
+    u_con(k*nu+1) =  T_max  - warm_u_[k](1);
+  }
+
+  // 블록 2: δc 상태 제약 (B_batch의 δc 행 추출)
+  for (int k = 0; k < N; ++k) {
+    A_con.row(n_box + k) = B_batch.row(k*nx + 6);
+    const double dc_warm = warm_x_[k+1](6);
+    l_con(n_box + k) = -dc_max - dc_warm;
+    u_con(n_box + k) =  dc_max - dc_warm;
+  }
+
+  // 블록 3: 마찰원 선형 근사 (논문 식 30)
+  // G_f ≤ 0, G_r ≤ 0 → Gg + D·δx + E·δu ≤ 0
+  const double mu_mg = params_.mu * params_.mass_kg * 9.81;
+  const double mu2   = mu_mg * mu_mg;
+  for (int k = 0; k < N; ++k) {
+    const auto& xg = warm_x_[k];
+    const auto   t  = computeTireForces(xg);
+
+    // warm start 힘 크기 (Gg)
+    const double Gf_warm = t.Fy_f * t.Fy_f + t.Fx_f * t.Fx_f - mu2;
+    const double Gr_warm = t.Fy_r * t.Fy_r + t.Fx_r * t.Fx_r - mu2;
+
+    // D(2×9), E(2×2)
+    Eigen::Matrix<double,2,9> D_k;
+    Eigen::Matrix<double,2,2> E_k;
+    frictionCircleJacobian(xg, t, D_k, E_k);
+
+    // ∂G/∂delta_U = D · B_batch[k*nx:(k+1)*nx, :]
+    Eigen::RowVectorXd row_f = D_k.row(0) * B_batch.block(k*nx, 0, nx, Nu);
+    Eigen::RowVectorXd row_r = D_k.row(1) * B_batch.block(k*nx, 0, nx, Nu);
+
+    A_con.row(n_box + n_dc + 2*k + 0) = row_f;
+    A_con.row(n_box + n_dc + 2*k + 1) = row_r;
+
+    // upper: -Gg (제약 ≤ 0이므로 우변 = -Gg_warm)
+    constexpr double kInf = 1e20;
+    l_con(n_box + n_dc + 2*k + 0) = -kInf;
+    l_con(n_box + n_dc + 2*k + 1) = -kInf;
+    u_con(n_box + n_dc + 2*k + 0) = -Gf_warm;
+    u_con(n_box + n_dc + 2*k + 1) = -Gr_warm;
+  }
+
+  const auto t_model_end = std::chrono::high_resolution_clock::now();
+  out.model_time_us = std::chrono::duration_cast<std::chrono::microseconds>(
+      t_model_end - t0).count();
+
+  // ── OSQP ─────────────────────────────────────────────────
+  Eigen::SparseMatrix<double> P_sp = H.sparseView();
+  Eigen::SparseMatrix<double> A_sp = A_con.sparseView();
+  P_sp.makeCompressed(); A_sp.makeCompressed();
+
+  std::vector<c_float> Pd, Av, qv, lv, uv;
+  std::vector<c_int>   Pi, Pp, Ai, Ap;
+
+  for (int i = 0; i < P_sp.nonZeros(); ++i) {
+    Pd.push_back(static_cast<c_float>(*(P_sp.valuePtr() + i)));
+    Pi.push_back(static_cast<c_int>(*(P_sp.innerIndexPtr() + i)));
+  }
+  for (int i = 0; i <= Nu; ++i) { Pp.push_back(static_cast<c_int>(*(P_sp.outerIndexPtr() + i))); }
+  for (int i = 0; i < A_sp.nonZeros(); ++i) {
+    Av.push_back(static_cast<c_float>(*(A_sp.valuePtr() + i)));
+    Ai.push_back(static_cast<c_int>(*(A_sp.innerIndexPtr() + i)));
+  }
+  for (int i = 0; i <= Nu; ++i) { Ap.push_back(static_cast<c_int>(*(A_sp.outerIndexPtr() + i))); }
+  for (int i = 0; i < Nu; ++i) { qv.push_back(static_cast<c_float>(gv(i))); }
+  for (int i = 0; i < n_con; ++i) {
+    lv.push_back(static_cast<c_float>(l_con(i)));
+    uv.push_back(static_cast<c_float>(u_con(i)));
+  }
+
+  OSQPData data{};
+  data.n = Nu; data.m = n_con;
+  data.P = csc_matrix(Nu, Nu, P_sp.nonZeros(), Pd.data(), Pi.data(), Pp.data());
+  data.q = qv.data();
+  data.A = csc_matrix(n_con, Nu, A_sp.nonZeros(), Av.data(), Ai.data(), Ap.data());
+  data.l = lv.data(); data.u = uv.data();
+
+  OSQPSettings settings{};
+  osqp_set_default_settings(&settings);
+  settings.verbose  = 0;
+  settings.polish   = 1;
+  settings.max_iter = 4000;
+  settings.eps_abs  = 1e-4;
+  settings.eps_rel  = 1e-4;
+
+  const auto t_solver_start = std::chrono::high_resolution_clock::now();
+  OSQPWorkspace* work = nullptr;
+  if (osqp_setup(&work, &data, &settings) != 0) {
+    c_free(data.P); c_free(data.A);
+    warm_valid_ = false;
+    return out;
+  }
+  osqp_solve(work);
+  const auto t_solver_end = std::chrono::high_resolution_clock::now();
+  out.solver_time_us = std::chrono::duration_cast<std::chrono::microseconds>(
+      t_solver_end - t_solver_start).count();
+
+  const bool ok = (work->info->status_val == OSQP_SOLVED ||
+                   work->info->status_val == OSQP_SOLVED_INACCURATE ||
+                   work->info->status_val == OSQP_MAX_ITER_REACHED);
+
+  if (ok) {
+    const double du_vd = static_cast<double>(work->solution->x[0]);
+    const double du_T  = static_cast<double>(work->solution->x[1]);
+
+    // 최적 절대 입력
+    const double vd_opt = std::clamp(warm_u_[0](0) + du_vd, -vd_max, vd_max);
+    const double T_opt  = std::clamp(warm_u_[0](1) + du_T,  -T_max,  T_max);
+
+    // δc 갱신 (1스텝 적분)
+    const double dc_new = std::clamp(state.delta_c + vd_opt * dt, -dc_max, dc_max);
+
+    out.delta_c_opt  = dc_new;
+    out.T_drive_opt  = T_opt;
+    out.kappa_cmd    = std::tan(dc_new) / std::max(params_.wheelbase, 0.01);
+    out.v_cmd        = std::clamp(std::abs(speed_mps), params_.min_velocity, params_.max_velocity);
+    out.omega_cmd    = out.v_cmd * out.kappa_cmd * (speed_mps >= 0.0 ? 1.0 : -1.0);
+    out.solved       = true;
+
+    // RTI warm start shift (논문 Algorithm 1)
+    std::vector<Eigen::Matrix<double,2,1>> new_u(N);
+    std::vector<V9> new_x(N+1);
+    new_x[0] = x0;
+    for (int i = 0; i < N-1; ++i) {
+      new_u[i](0) = std::clamp(warm_u_[i+1](0) + static_cast<double>(work->solution->x[(i+1)*nu+0]), -vd_max, vd_max);
+      new_u[i](1) = std::clamp(warm_u_[i+1](1) + static_cast<double>(work->solution->x[(i+1)*nu+1]), -T_max, T_max);
+    }
+    new_u[N-1] = new_u[N-2];
+    for (int k = 0; k < N; ++k) { new_x[k+1] = dbmImplicitEuler(new_x[k], new_u[k]); }
+    warm_u_ = new_u;
+    warm_x_ = new_x;
+
+    // 예측 궤적
+    out.predicted_xy.reserve(N);
+    for (int k = 1; k <= N; ++k) {
+      out.predicted_xy.push_back({warm_x_[k](0), warm_x_[k](1), 0.0});
+    }
+  } else {
+    warm_valid_ = false;
+  }
+
+  osqp_cleanup(work);
+  c_free(data.P); c_free(data.A);
+  return out;
+}
+
+// ============================================================
+// MPCControllerCpp (레거시 호환 wrapper)
+// ============================================================
+MPCControllerCpp::MPCControllerCpp() {
+  // DBM 파라미터를 소형 스케일에 맞게 초기화
+  dbm_params_ = DBMRTINMPCParams{};
+  dbm_ctrl_.setConfig(dbm_params_);
+}
+
+void MPCControllerCpp::update_parameters(const LTVMPCParams& p) {
+  params_ = p;
+  dbm_params_.N            = p.N;
+  dbm_params_.Ts           = p.Ts;
+  dbm_params_.wheelbase    = p.l;
+  dbm_params_.max_velocity = p.max_velocity;
+  dbm_params_.min_velocity = p.min_velocity;
+  dbm_params_.mu           = p.mu;
+  dbm_params_.w_u_delta    = p.wu;
+  dbm_params_.w_u_torque   = p.wu;
+  dbm_ctrl_.setConfig(dbm_params_);
 }
 
 void MPCControllerCpp::reset_state() {
-    current_kappa_ = 0.0;
+  dbm_ctrl_.reset();
+  est_vx_ = est_vy_ = est_omega_ = 0.0;
+  est_delta_ = est_omegaf_ = est_omegar_ = 0.0;
 }
 
-// ===================================================================
-// 올바른 Quaternion to Yaw 변환
-// ===================================================================
-double MPCControllerCpp::quaternion_to_yaw(const geometry_msgs::msg::Quaternion& q) {
-    // Hybrid yaw extraction:
-    // - For standard quaternions (norm ~ 1): use quaternion->yaw conversion.
-    // - For simulator-packed orientations (often x≈1.57, w≈1, z=yaw but NOT a valid quaternion): use yaw = z.
-    const double norm = std::sqrt(q.x*q.x + q.y*q.y + q.z*q.z + q.w*q.w);
-
-    auto wrap = [](double a){
-        while (a > M_PI)  a -= 2.0*M_PI;
-        while (a < -M_PI) a += 2.0*M_PI;
-        return a;
-    };
-
-    // If it's not close to a unit quaternion, interpret as Euler-packed and take z as yaw.
-    if (!std::isfinite(norm) || std::abs(norm - 1.0) > 0.15) {
-        return wrap(q.z);
-    }
-
-    const double x = q.x / norm;
-    const double y = q.y / norm;
-    const double z = q.z / norm;
-    const double w = q.w / norm;
-
-    const double siny_cosp = 2.0 * (w * z + x * y);
-    const double cosy_cosp = 1.0 - 2.0 * (y * y + z * z);
-    return wrap(std::atan2(siny_cosp, cosy_cosp));
+void MPCControllerCpp::setEstimatedState(
+    double vx, double vy, double omega,
+    double delta_c, double omega_f, double omega_r)
+{
+  est_vx_    = vx;
+  est_vy_    = vy;
+  est_omega_ = omega;
+  est_delta_ = delta_c;
+  est_omegaf_ = omega_f;
+  est_omegar_ = omega_r;
 }
 
-// ===================================================================
-// Equation (2): 연속시간 시스템 행렬
-// ===================================================================
-// ẋ = Ac*x + Bc*u + Ec*z
-// 
-// x = [dr, theta, kappa, theta_r, kappa_r]^T
-// u = kappa_dot (곡률 변화율)
-// z = kappa_r_dot (기준 곡률 변화율)
-// ===================================================================
-void MPCControllerCpp::compute_system_matrices_continuous(
-    double v,
-    Eigen::MatrixXd& Ac,
-    Eigen::VectorXd& Bc,
-    Eigen::VectorXd& Ec) {
-    
-    // Ac(t) - 5x5 행렬
-    Ac = Eigen::MatrixXd::Zero(5, 5);
-    Ac(0, 1) = v;      // ḋr = v*(theta - theta_r)
-    Ac(0, 3) = -v;
-    Ac(1, 2) = v;      // θ̇ = v*kappa
-    Ac(3, 4) = v;      // θ̇r = v*kappa_r
-    
-    // Bc - 5x1 벡터
-    Bc = Eigen::VectorXd::Zero(5);
-    Bc(2) = 1.0;       // κ̇ = u
-    
-    // Ec - 5x1 벡터
-    Ec = Eigen::VectorXd::Zero(5);
-    Ec(4) = 1.0;       // κ̇r = z
+double MPCControllerCpp::quatToYaw(const geometry_msgs::msg::Quaternion& q) {
+  const double n = std::sqrt(q.x*q.x + q.y*q.y + q.z*q.z + q.w*q.w);
+  auto wrap = [](double a) {
+    while (a > kPi)  a -= 2.0*kPi;
+    while (a < -kPi) a += 2.0*kPi;
+    return a;
+  };
+  if (!std::isfinite(n) || std::abs(n - 1.0) > 0.15) return wrap(q.z);
+  const double x = q.x/n, y = q.y/n, z = q.z/n, w = q.w/n;
+  return wrap(std::atan2(2.0*(w*z + x*y), 1.0 - 2.0*(y*y + z*z)));
 }
 
-// ===================================================================
-// Equation (4): 출력 행렬 (3원 차량 근사)
-// ===================================================================
-// y = [d1, d2, d3, kappa]^T
-// di = dr + li*(theta - theta_r)
-// 
-// l1 = 0     (후륜 중심)
-// l2 = l/2   (차량 중앙)
-// l3 = l     (전륜 중심)
-// ===================================================================
-void MPCControllerCpp::compute_output_matrix(Eigen::MatrixXd& C) {
-    C = Eigen::MatrixXd::Zero(4, 5);
-    
-    // d1 = dr
-    C(0, 0) = 1.0;
-    
-    // d2 = dr + (l/2)*(theta - theta_r)
-    C(1, 0) = 1.0;
-    C(1, 1) = params_.l / 2.0;
-    C(1, 3) = -params_.l / 2.0;
-    
-    // d3 = dr + l*(theta - theta_r)
-    C(2, 0) = 1.0;
-    C(2, 1) = params_.l;
-    C(2, 3) = -params_.l;
-    
-    // kappa
-    C(3, 2) = 1.0;
-}
-
-// ===================================================================
-// Equation (5): 이산화 (Exact discretization)
-// ===================================================================
-// A(k) = e^(Ac*Ts)
-// B(k) = Ac^(-1) * (A - I) * Bc
-// E(k) = Ac^(-1) * (A - I) * Ec
-// ===================================================================
-void MPCControllerCpp::discretize_system(
-    const Eigen::MatrixXd& Ac,
-    const Eigen::VectorXd& Bc,
-    const Eigen::VectorXd& Ec,
-    double Ts,
-    Eigen::MatrixXd& A,
-    Eigen::MatrixXd& B,
-    Eigen::MatrixXd& E) {
-
-    const int n = Ac.rows();
-
-    // Robust exact discretization using augmented matrix exponential (Van Loan method).
-    // Avoids Ac.inverse() which is invalid when Ac is singular (common in this model).
-    if (!std::isfinite(Ts) || Ts <= 1e-6) Ts = 0.05;
-
-    Eigen::MatrixXd M = Eigen::MatrixXd::Zero(n + 2, n + 2);
-    M.block(0, 0, n, n) = Ac;
-    M.block(0, n, n, 1) = Bc;
-    M.block(0, n + 1, n, 1) = Ec;
-
-    Eigen::MatrixXd expM = (M * Ts).exp();
-    A = expM.block(0, 0, n, n);
-    B = expM.block(0, n, n, 1);
-    E = expM.block(0, n + 1, n, 1);
-}
-
-
-
-// ===================================================================
-// Equation (16-17): 배치 정식화 (Batch formulation)
-// ===================================================================
-// x_bar = A_bar*x0 + B_bar*u + E_bar*z
-// y_bar = C_bar*x_bar
-//
-// A_bar: (5N x 5) - 상태 전파
-// B_bar: (5N x N) - 입력 영향 (하삼각 구조)
-// E_bar: (5N x N) - 외란 영향
-// C_bar: (4N x 5N) - 출력 변환
-// ===================================================================
-void MPCControllerCpp::build_prediction_matrices(
-    const std::vector<double>& v_profile,
-    Eigen::MatrixXd& A_bar,
-    Eigen::MatrixXd& B_bar,
-    Eigen::MatrixXd& E_bar,
-    Eigen::MatrixXd& C_bar) {
-    
-    int N = params_.N;
-    double Ts = params_.Ts;
-    
-    // 각 시간 스텝에 대한 시스템 행렬 계산
-    std::vector<Eigen::MatrixXd> A_list(N), B_list(N), E_list(N), C_list(N);
-    
-    for (int k = 0; k < N; ++k) {
-        double v_k = (k < (int)v_profile.size()) ? v_profile[k] : v_profile.back();
-        
-        Eigen::MatrixXd Ac;
-        Eigen::VectorXd Bc, Ec;
-        compute_system_matrices_continuous(v_k, Ac, Bc, Ec);
-        
-        Eigen::MatrixXd A_k, B_k, E_k;
-        discretize_system(Ac, Bc, Ec, Ts, A_k, B_k, E_k);
-        
-        Eigen::MatrixXd C_k;
-        compute_output_matrix(C_k);
-        
-        A_list[k] = A_k;
-        B_list[k] = B_k;
-        E_list[k] = E_k;
-        C_list[k] = C_k;
-    }
-    
-    // A_bar 구성: x(k) = A(k-1) ... A(1) A(0) * x0
-    A_bar = Eigen::MatrixXd::Zero(5 * N, 5);
-    for (int i = 0; i < N; ++i) {
-        Eigen::MatrixXd prod = Eigen::MatrixXd::Identity(5, 5);
-        for (int j = 0; j <= i; ++j) {
-            prod = A_list[j] * prod;
-        }
-        A_bar.block(i * 5, 0, 5, 5) = prod;
-    }
-    
-    // B_bar 구성: 하삼각 블록 행렬
-    // x(k) = ... + ∑[j=0 to k-1] (∏[i=j+1 to k-1] A(i)) * B(j) * u(j)
-    B_bar = Eigen::MatrixXd::Zero(5 * N, N);
-    for (int i = 0; i < N; ++i) {
-        for (int j = 0; j <= i; ++j) {
-            Eigen::MatrixXd prod = Eigen::MatrixXd::Identity(5, 5);
-            for (int k = j + 1; k <= i; ++k) {
-                prod = A_list[k] * prod;
-            }
-            B_bar.block(i * 5, j, 5, 1) = prod * B_list[j];
-        }
-    }
-    
-    // E_bar 구성: B_bar와 동일한 구조
-    E_bar = Eigen::MatrixXd::Zero(5 * N, N);
-    for (int i = 0; i < N; ++i) {
-        for (int j = 0; j <= i; ++j) {
-            Eigen::MatrixXd prod = Eigen::MatrixXd::Identity(5, 5);
-            for (int k = j + 1; k <= i; ++k) {
-                prod = A_list[k] * prod;
-            }
-            E_bar.block(i * 5, j, 5, 1) = prod * E_list[j];
-        }
-    }
-    
-    // C_bar 구성: 블록 대각 행렬
-    C_bar = Eigen::MatrixXd::Zero(4 * N, 5 * N);
-    for (int i = 0; i < N; ++i) {
-        C_bar.block(i * 4, i * 5, 4, 5) = C_list[i];
-    }
-}
-
-// ===================================================================
-// Equation (11): 비용 함수 행렬 (상태 공간에서 정의)
-// ===================================================================
-// J = x^T*Q*x + u^T*R*u
-//
-// Q: 상태 비용 (5N x 5N, 블록 대각)
-// R: 입력 비용 (N x N, 대각)
-//
-// x = [dr, theta, kappa, theta_r, kappa_r]^T (5차원 상태)
-// ===================================================================
-void MPCControllerCpp::compute_cost_matrices(
-    const std::vector<double>& v_profile,
-    Eigen::MatrixXd& Q_bar,
-    Eigen::MatrixXd& R_bar) {
-    
-    int N = params_.N;
-    
-    // Q_bar: 블록 대각 행렬 (5N x 5N) - 상태 공간
-    Q_bar = Eigen::MatrixXd::Zero(5 * N, 5 * N);
-    
-    for (int k = 0; k < N; ++k) {
-        double v_k = (k < (int)v_profile.size()) ? v_profile[k] : v_profile.back();
-        
-        // 속도 의존 가중치
-        double wd_k = params_.wd;
-        double wkappa_k = params_.wkappa + 0.5 * v_k;  // 고속에서 곡률 더 패널티
-        
-        // LTV core와 동일한 heading penalty: (theta - theta_r)^2
-        Eigen::MatrixXd Q_k = Eigen::MatrixXd::Zero(5, 5);
-        Q_k(0, 0) = wd_k;
-        Q_k(1, 1) = params_.wtheta;
-        Q_k(1, 3) = -params_.wtheta;
-        Q_k(2, 2) = wkappa_k;
-        Q_k(3, 1) = -params_.wtheta;
-        Q_k(3, 3) = params_.wtheta;
-        
-        Q_bar.block(k * 5, k * 5, 5, 5) = Q_k;
-    }
-    
-    // R_bar: 입력 비용 (대각 행렬)
-    // 최소값 보장으로 수치 안정성 향상
-    double wu_safe = std::max(params_.wu, 1e-9);  // very small floor only for numerical stability
-    R_bar = Eigen::MatrixXd::Identity(N, N) * wu_safe;
-}
-
-// ===================================================================
-// 3점 곡률 계산
-// ===================================================================
-double MPCControllerCpp::compute_curvature_3points(
-    double x1, double y1,
-    double x2, double y2,
-    double x3, double y3) {
-    
-    double dx1 = x2 - x1;
-    double dy1 = y2 - y1;
-    double dx2 = x3 - x2;
-    double dy2 = y3 - y2;
-    
-    double cross = dx1 * dy2 - dy1 * dx2;
-    double d1 = std::sqrt(dx1 * dx1 + dy1 * dy1);
-    double d2 = std::sqrt(dx2 * dx2 + dy2 * dy2);
-    
-    if (d1 < 1e-6 || d2 < 1e-6) return 0.0;
-    
-    // Signed curvature with consistent 1/m unit.
-    // κ = 2 * cross / (d1 * d2 * (d1 + d2))
-    return (2.0 * cross) / (d1 * d2 * (d1 + d2) + 1e-6);
-}
-
-// [다음 파일에 계속...]
-// ===================================================================
-// Part 2: 보조 함수 및 상태 계산
-// ===================================================================
-
-// ===================================================================
-// 가장 가까운 경로점 찾기
-// ===================================================================
-int MPCControllerCpp::find_closest_waypoint(
-    const geometry_msgs::msg::Pose& current_pose,
-    const std::vector<geometry_msgs::msg::PoseStamped>& path) {
-    
-    if (path.empty()) return -1;
-    
-    double x = current_pose.position.x;
-    double y = current_pose.position.y;
-    
-    int closest_idx = 0;
-    double min_dist = std::numeric_limits<double>::max();
-    
-    for (size_t i = 0; i < path.size(); ++i) {
-        double dx = path[i].pose.position.x - x;
-        double dy = path[i].pose.position.y - y;
-        double dist = std::sqrt(dx * dx + dy * dy);
-        
-        if (dist < min_dist) {
-            min_dist = dist;
-            closest_idx = i;
-        }
-    }
-    
-    return closest_idx;
-}
-
-// ===================================================================
-// Equation (7): 상태 벡터 계산
-// ===================================================================
-// x = [dr, theta, kappa, theta_r, kappa_r]^T
-//
-// dr: 기준 경로로부터의 수직 거리 (lateral deviation)
-// theta: 차량 방향각
-// theta_r: 기준 경로 방향각
-// kappa: 차량 곡률
-// kappa_r: 기준 경로 곡률
-// ===================================================================
-Eigen::VectorXd MPCControllerCpp::compute_state_vector(
-    const geometry_msgs::msg::Pose& current_pose,
-    const std::vector<geometry_msgs::msg::PoseStamped>& reference_path) {
-    
-    Eigen::VectorXd x0 = Eigen::VectorXd::Zero(5);
-    
-    if (reference_path.size() < 3) {
-        return x0;
-    }
-    
-    // 현재 차량 상태
-    double x_veh = current_pose.position.x;
-    double y_veh = current_pose.position.y;
-    double theta = quaternion_to_yaw(current_pose.orientation);
-    
-    // 가장 가까운 기준 경로점 찾기
-    int closest_idx = find_closest_waypoint(current_pose, reference_path);
-    
-    // 기준 경로 상태
-    double x_ref = reference_path[closest_idx].pose.position.x;
-    double y_ref = reference_path[closest_idx].pose.position.y;
-    double theta_ref = 0.0;
-    {
-        const int n = static_cast<int>(reference_path.size());
-        int idx0 = std::max(0, std::min(closest_idx, n - 1));
-
-        // Prefer path quaternion yaw (already generated in global_path_pub_multi.py).
-        theta_ref = quaternion_to_yaw(reference_path[idx0].pose.orientation);
-
-        // Fallback to geometric tangent when quaternion is unavailable/degenerate.
-        int idx1 = (idx0 + 1) % n;
-        const double dxr = reference_path[idx1].pose.position.x - reference_path[idx0].pose.position.x;
-        const double dyr = reference_path[idx1].pose.position.y - reference_path[idx0].pose.position.y;
-        if (std::hypot(dxr, dyr) > 1e-6) {
-            const double tangent_yaw = std::atan2(dyr, dxr);
-            // Blend on wrapped delta to avoid ±pi boundary artifacts.
-            double dyaw = tangent_yaw - theta_ref;
-            while (dyaw > M_PI) dyaw -= 2.0 * M_PI;
-            while (dyaw < -M_PI) dyaw += 2.0 * M_PI;
-            theta_ref += 0.3 * dyaw;
-        }
-
-        while (theta_ref > M_PI) theta_ref -= 2.0 * M_PI;
-        while (theta_ref < -M_PI) theta_ref += 2.0 * M_PI;
-    }
-    
-    // dr: 수직 거리 계산
-    // 경로의 접선 벡터에 수직인 방향으로의 거리
-    double dx = x_veh - x_ref;
-    double dy = y_veh - y_ref;
-    
-    // 기준 경로의 법선 방향으로 투영
-    double dr = -std::sin(theta_ref) * dx + std::cos(theta_ref) * dy;
-    
-    // kappa: 현재 차량 곡률 (저장된 값 사용)
-    double kappa = current_kappa_;
-    
-    // kappa_r: 기준 경로 곡률 (3점 계산)
-    double kappa_r = 0.0;
-    if (closest_idx + 2 < (int)reference_path.size()) {
-        double x1 = reference_path[closest_idx].pose.position.x;
-        double y1 = reference_path[closest_idx].pose.position.y;
-        double x2 = reference_path[closest_idx + 1].pose.position.x;
-        double y2 = reference_path[closest_idx + 1].pose.position.y;
-        double x3 = reference_path[closest_idx + 2].pose.position.x;
-        double y3 = reference_path[closest_idx + 2].pose.position.y;
-        
-        kappa_r = compute_curvature_3points(x1, y1, x2, y2, x3, y3);
-    }
-    
-    // 상태 벡터 구성
-    x0(0) = dr;
-    x0(1) = theta;
-    x0(2) = kappa;
-    x0(3) = theta_ref;
-    x0(4) = kappa_r;
-    
-    return x0;
-}
-
-// ===================================================================
-// Equation (7): 외란 신호 계산
-// ===================================================================
-// z(k) = dκr/dt = (κr(k+1) - κr(k)) / Ts
-// ===================================================================
-Eigen::VectorXd MPCControllerCpp::compute_disturbance_signal(
-    const std::vector<geometry_msgs::msg::PoseStamped>& reference_path) {
-    
-    int N = params_.N;
-    double Ts = params_.Ts;
-    
-    Eigen::VectorXd z = Eigen::VectorXd::Zero(N);
-    
-    if (reference_path.size() < 3) {
-        return z;
-    }
-    
-    // 각 예측 스텝에 대한 기준 곡률 계산
-    std::vector<double> kappa_r_profile;
-    
-    for (size_t i = 0; i + 2 < reference_path.size(); ++i) {
-        double x1 = reference_path[i].pose.position.x;
-        double y1 = reference_path[i].pose.position.y;
-        double x2 = reference_path[i + 1].pose.position.x;
-        double y2 = reference_path[i + 1].pose.position.y;
-        double x3 = reference_path[i + 2].pose.position.x;
-        double y3 = reference_path[i + 2].pose.position.y;
-        
-        double kappa_r = compute_curvature_3points(x1, y1, x2, y2, x3, y3);
-        kappa_r_profile.push_back(kappa_r);
-    }
-    
-    // 외란 신호 z(k) = (κr(k+1) - κr(k)) / Ts
-    for (int k = 0; k < N - 1; ++k) {
-        if (k + 1 < (int)kappa_r_profile.size()) {
-            z(k) = (kappa_r_profile[k + 1] - kappa_r_profile[k]) / Ts;
-        }
-    }
-    
-    return z;
-}
-
-// ===================================================================
-// 속도 프로파일 생성 (곡률 기반)
-// ===================================================================
-std::vector<double> MPCControllerCpp::generate_velocity_profile(
-    const std::vector<geometry_msgs::msg::PoseStamped>& reference_path) {
-    
-    int N = params_.N;
-    std::vector<double> v_profile(N, params_.max_velocity);
-    
-    if (reference_path.size() < 3) {
-        return v_profile;
-    }
-    
-    // 각 예측 스텝에 대한 속도 계산
-    for (int k = 0; k < N; ++k) {
-        size_t idx = std::min((size_t)k, reference_path.size() - 3);
-        
-        double x1 = reference_path[idx].pose.position.x;
-        double y1 = reference_path[idx].pose.position.y;
-        double x2 = reference_path[idx + 1].pose.position.x;
-        double y2 = reference_path[idx + 1].pose.position.y;
-        double x3 = reference_path[idx + 2].pose.position.x;
-        double y3 = reference_path[idx + 2].pose.position.y;
-        
-        double kappa_r = compute_curvature_3points(x1, y1, x2, y2, x3, y3);
-        
-        // 곡률에 따른 속도 감소
-        // v = v_max / (1 + α*|κ|)
-        double alpha = 3.0;
-        double v_k = params_.max_velocity / (1.0 + alpha * std::abs(kappa_r));
-        v_k = std::max(params_.min_velocity, std::min(v_k, params_.max_velocity));
-        
-        v_profile[k] = v_k;
-    }
-    
-    return v_profile;
-}
-
-// ===================================================================
-// Kamm's circle 기반 곡률 제한
-// ===================================================================
-// |κ| ≤ μ*g/v²
-// ===================================================================
-void MPCControllerCpp::compute_curvature_limits(
-    double v,
-    double& kappa_min,
-    double& kappa_max) {
-    
-    kappa_max = params_.kappa_max_delta;
-    kappa_min = params_.kappa_min_delta;
-
-    // No tire friction model in this simulator. If mu<=0, skip Kamm's-circle limiting.
-    if (params_.mu <= 0.0) {
-        return;
-    }
-    
-    if (v > 0.1) {
-        // Kamm's circle 마찰 제약
-        double v2 = v * v;
-        double friction_limit = params_.mu * params_.g / (v2 + 0.01);
-        
-        kappa_max = std::min(kappa_max, friction_limit);
-        kappa_min = std::max(kappa_min, -friction_limit);
-    }
-}
-
-// ===================================================================
-// Dense to Sparse 변환 (OSQP 입력용)
-// OSQP는 P 행렬이 상삼각(upper triangular)이어야 함
-// ===================================================================
-Eigen::SparseMatrix<double> MPCControllerCpp::dense_to_sparse(
-    const Eigen::MatrixXd& dense) {
-    
-    // 상삼각 부분만 추출 (OSQP 요구사항)
-    // TriangularView -> Dense -> Sparse 순서로 변환
-    Eigen::MatrixXd upper_dense = dense.triangularView<Eigen::Upper>();
-    Eigen::SparseMatrix<double> sparse = upper_dense.sparseView();
-    sparse.makeCompressed();
-    return sparse;
-}
-
-// ===================================================================
-// Part 3: QP 문제 구성 및 해결
-// ===================================================================
-
-// ===================================================================
-// Equation (18), (23): QP 문제 구성
-// ===================================================================
-// 원래 문제:
-//   minimize:  x^T*Q*x + u^T*R*u
-//   subject to: x = A_bar*x0 + B_bar*u + E_bar*z
-//               u_min <= u <= u_max
-//               d_min <= C_bar*x <= d_max
-//
-// QP 형태로 변환:
-//   minimize:  0.5*u^T*H*u + f^T*u
-//   subject to: l <= A_qp*u <= u
-//
-// H = B_bar^T * Q_state * B_bar + R
-// f = B_bar^T * Q_state * (A_bar*x0 + E_bar*z)
-// ===================================================================
-bool MPCControllerCpp::formulate_qp(
-    const Eigen::VectorXd& x0,
-    const Eigen::VectorXd& z,
-    const std::vector<double>& v_profile,
-    const CollisionConstraints& constraints,
-    Eigen::SparseMatrix<double>& P,
-    Eigen::VectorXd& q,
-    Eigen::SparseMatrix<double>& A_qp,
-    Eigen::VectorXd& l,
-    Eigen::VectorXd& u) {
-    
-    int N = params_.N;
-    // 예측 행렬 계산
-    Eigen::MatrixXd A_bar, B_bar, E_bar, C_bar;
-    build_prediction_matrices(v_profile, A_bar, B_bar, E_bar, C_bar);
-    (void)C_bar;
-    
-    // 비용 행렬 계산
-    Eigen::MatrixXd Q_bar, R_bar;
-    compute_cost_matrices(v_profile, Q_bar, R_bar);
-    
-    // 상태 예측: x_pred = A_bar*x0 + E_bar*z
-    Eigen::VectorXd x_pred = A_bar * x0 + E_bar * z;
-    
-    // Equation (18): QP 변환 (state-space cost)
-    // H = B^T * Q * B + R
-    Eigen::MatrixXd H_dense = B_bar.transpose() * Q_bar * B_bar + R_bar;
-    
-    // 대칭화 (수치 오차 방지)
-    H_dense = 0.5 * (H_dense + H_dense.transpose());
-    
-    // Regularization 추가 (PSD 보장)
-    // P가 positive semi-definite이어야 convex QP
-    int n = H_dense.rows();
-    double eps = 1e-6;  // 작은 regularization으로 convexity 보장 + 해 왜곡 최소화
-    H_dense += eps * Eigen::MatrixXd::Identity(n, n);
-    
-    // f = B^T * Q * (A*x0 + E*z)
-    Eigen::VectorXd f = B_bar.transpose() * Q_bar * x_pred;
-    
-    // OSQP는 0.5*x^T*P*x + q^T*x 형태를 기대
-    // 우리: x^T*H*x + 2*f^T*x
-    // 변환: P = 2*H, q = 2*f
-    P = dense_to_sparse(2.0 * H_dense);
-    q = 2.0 * f;
-    
-    // ===================================================================
-    // 제약 조건 구성
-    // ===================================================================
-    
-    std::vector<Eigen::Triplet<double>> triplets;
-    std::vector<double> lower_bounds, upper_bounds;
-    
-    int constraint_count = 0;
-    
-    // (1) Equation (9): 입력 제약
-    // u_min <= u(k) <= u_max
-    for (int k = 0; k < N; ++k) {
-        triplets.push_back(Eigen::Triplet<double>(constraint_count, k, 1.0));
-        lower_bounds.push_back(params_.u_min);
-        upper_bounds.push_back(params_.u_max);
-        constraint_count++;
-    }
-    
-    // (2) 곡률 제약 - 간접적으로 입력 제약으로 처리됨
-    
-    // (3) 출력 제약 - 현재는 제거 (수치 안정성 우선)
-    // TODO: 충돌 회피 제약은 안정화 후 추가
-    
-    // 제약 행렬 구성 (입력 제약만)
-    A_qp.resize(constraint_count, N);
-    A_qp.setFromTriplets(triplets.begin(), triplets.end());
-    A_qp.makeCompressed();
-    
-    l = Eigen::Map<Eigen::VectorXd>(lower_bounds.data(), lower_bounds.size());
-    u = Eigen::Map<Eigen::VectorXd>(upper_bounds.data(), upper_bounds.size());
-    
-    return true;
-}
-
-// ===================================================================
-// OSQP로 QP 문제 해결
-// ===================================================================
-bool MPCControllerCpp::solve_qp_osqp(
-    const Eigen::SparseMatrix<double>& P,
-    const Eigen::VectorXd& q,
-    const Eigen::SparseMatrix<double>& A,
-    const Eigen::VectorXd& l,
-    const Eigen::VectorXd& u,
-    Eigen::VectorXd& solution) {
-    
-    c_int n = P.rows();
-    c_int m = A.rows();
-    
-    // Eigen Sparse -> OSQP CSC format
-    std::vector<c_float> P_data(P.nonZeros());
-    std::vector<c_int> P_indices(P.nonZeros());
-    std::vector<c_int> P_indptr(n + 1);
-    
-    int idx = 0;
-    for (int k = 0; k < P.outerSize(); ++k) {
-        P_indptr[k] = idx;
-        for (Eigen::SparseMatrix<double>::InnerIterator it(P, k); it; ++it) {
-            P_data[idx] = it.value();
-            P_indices[idx] = it.row();
-            idx++;
-        }
-    }
-    P_indptr[n] = idx;
-    
-    std::vector<c_float> q_data(n);
-    for (int i = 0; i < n; ++i) {
-        q_data[i] = q(i);
-    }
-    
-    std::vector<c_float> A_data(A.nonZeros());
-    std::vector<c_int> A_indices(A.nonZeros());
-    std::vector<c_int> A_indptr(n + 1);
-    
-    idx = 0;
-    for (int k = 0; k < A.outerSize(); ++k) {
-        A_indptr[k] = idx;
-        for (Eigen::SparseMatrix<double>::InnerIterator it(A, k); it; ++it) {
-            A_data[idx] = it.value();
-            A_indices[idx] = it.row();
-            idx++;
-        }
-    }
-    A_indptr[n] = idx;
-    
-    std::vector<c_float> l_data(m), u_data(m);
-    for (int i = 0; i < m; ++i) {
-        l_data[i] = l(i);
-        u_data[i] = u(i);
-    }
-    
-    // OSQP 데이터 구조체
-    OSQPData data;
-    data.n = n;
-    data.m = m;
-    data.P = csc_matrix(n, n, P_data.size(), P_data.data(), P_indices.data(), P_indptr.data());
-    data.q = q_data.data();
-    data.A = csc_matrix(m, n, A_data.size(), A_data.data(), A_indices.data(), A_indptr.data());
-    data.l = l_data.data();
-    data.u = u_data.data();
-    
-    // OSQP 설정
-    OSQPSettings settings;
-    osqp_set_default_settings(&settings);
-    settings.verbose = 0;          // 로그 끄기
-    settings.polish = 1;           // Solution polishing
-    settings.max_iter = 4000;      // 최대 반복
-    settings.eps_abs = 1e-4;
-    settings.eps_rel = 1e-4;
-    
-    // Solver 생성
-    OSQPWorkspace* work = nullptr;
-    c_int exitflag = osqp_setup(&work, &data, &settings);
-    
-    if (exitflag != 0) {
-        return false;
-    }
-    
-    // 문제 해결
-    osqp_solve(work);
-    
-    // 해가 수렴했는지 확인
-    bool success = (work->info->status_val == OSQP_SOLVED || 
-                   work->info->status_val == OSQP_SOLVED_INACCURATE);
-    
-    if (success) {
-        solution = Eigen::VectorXd(n);
-        for (int i = 0; i < n; ++i) {
-            solution(i) = work->solution->x[i];
-        }
-    }
-    
-    // 정리
-    osqp_cleanup(work);
-    
-    return success;
-}
-
-// ===================================================================
-// 메인 제어 함수
-// ===================================================================
 ControlOutput MPCControllerCpp::compute_control(
     const geometry_msgs::msg::Pose& current_pose,
     const std::vector<geometry_msgs::msg::PoseStamped>& local_path,
-    const CollisionConstraints& constraints) {
-    
-    ControlOutput output;
-    output.velocity = 0.0;
-    output.angular_velocity = 0.0;
-    
-    if (local_path.size() < 5) {
-        return output;
-    }
-    
-    // 1. 상태 벡터 계산 (Equation 7)
-    Eigen::VectorXd x0 = compute_state_vector(current_pose, local_path);
-    
-    // 2. 외란 신호 계산 (Equation 7)
-    Eigen::VectorXd z = compute_disturbance_signal(local_path);
-    
-    // 3. 속도 프로파일 생성
-    std::vector<double> v_profile = generate_velocity_profile(local_path);
-    
-    // 4. QP 문제 구성 (Equation 18, 23)
-    Eigen::SparseMatrix<double> P, A_qp;
-    Eigen::VectorXd q, l, u;
-    
-    bool formulated = formulate_qp(x0, z, v_profile, constraints, P, q, A_qp, l, u);
-    
-    if (!formulated) {
-        return output;
-    }
-    
-    // 5. QP 해결 (OSQP)
-    Eigen::VectorXd u_solution;
-    bool solved = solve_qp_osqp(P, q, A_qp, l, u, u_solution);
-    
-    if (!solved || u_solution.size() == 0) {
-        return output;
-    }
-    
-    // 6. 첫 번째 제어 입력 적용
-    double u0 = u_solution(0);  // 곡률 변화율
-    
-    // 곡률 업데이트
-    current_kappa_ += u0 * params_.Ts;
-    
-    // 곡률 제약 적용
-    double kappa_min, kappa_max;
-    compute_curvature_limits(v_profile[0], kappa_min, kappa_max);
-    current_kappa_ = std::max(kappa_min, std::min(current_kappa_, kappa_max));
-    
-    // 7. 속도 및 각속도 계산
-    double velocity = v_profile[0];
-    double omega = velocity * current_kappa_;
-    
-    output.velocity = velocity;
-    output.angular_velocity = omega;
-    
-    // 8. 예측 궤적 생성 (visualization)
-    double x = current_pose.position.x;
-    double y = current_pose.position.y;
-    double yaw = quaternion_to_yaw(current_pose.orientation);
-    
-    for (int k = 0; k < params_.N; ++k) {
-        x += velocity * std::cos(yaw) * params_.Ts;
-        y += velocity * std::sin(yaw) * params_.Ts;
-        yaw += omega * params_.Ts;
-        
-        output.predicted_trajectory.push_back({x, y, 0.0});
-    }
-    
-    return output;
+    const CollisionConstraints&)
+{
+  ControlOutput out;
+  if (local_path.empty()) return out;
+
+  DBMState state;
+  state.px      = current_pose.position.x;
+  state.py      = current_pose.position.y;
+  state.psi     = quatToYaw(current_pose.orientation);
+  state.vx      = est_vx_;
+  state.vy      = est_vy_;
+  state.omega   = est_omega_;
+  state.delta_c = est_delta_;
+  state.omega_f = est_omegaf_;
+  state.omega_r = est_omegar_;
+
+  const double speed = (est_vx_ >= 0.0 ? 1.0 : -1.0) *
+    std::max(std::abs(est_vx_), params_.min_velocity);
+
+  const DBMCommand cmd = dbm_ctrl_.computeControl(state, local_path, speed);
+  if (!cmd.solved) return out;
+
+  out.velocity         = cmd.v_cmd;
+  out.angular_velocity = cmd.omega_cmd;
+  for (const auto& pt : cmd.predicted_xy) {
+    out.predicted_trajectory.push_back(pt);
+  }
+  return out;
 }
 
 }  // namespace bisa

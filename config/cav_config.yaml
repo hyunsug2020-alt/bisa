@@ -99,6 +99,7 @@
 mpc_tracker_cav01:
   ros__parameters:
     time_step: 0.05
+    use_ltv_mpc: false   
     Q_pos: 130.0
     Q_heading: 165.0
     weight_curvature: 1.5
